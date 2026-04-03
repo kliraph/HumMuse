@@ -2,27 +2,160 @@
 
 from __future__ import annotations
 
+import json
 import mimetypes
+import time
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from backend.api_models import (
+    ArtifactListingResponse,
+    ChordsFromMelodyRequest,
+    ChordsFromMelodyResponse,
     LyricsToChordsRequest,
     LyricsToChordsResponse,
+    MelodyContinueRequest,
+    MelodyContinueResponse,
+    MelodyFromHumResponse,
+    RefineSessionRequest,
+    SessionChatRequest,
+    SessionChatResponse,
+    SessionCreateRequest,
+    SessionStateResponse,
+    SuggestLyricsRequest,
+    SuggestLyricsResponse,
     WriterBlockHelpRequest,
     WriterBlockHelpResponse,
 )
+from backend.database import Database
 from backend.experiment_logger import ExperimentLogger
+from backend.logging_config import (
+    bind_request_context,
+    get_logger,
+    get_request_context,
+    initialize_request_context,
+)
+from backend.mock_pipeline import (
+    add_history,
+    append_chat_message,
+    build_chat_reply,
+    build_emotion_vector,
+    build_explanation_report,
+    build_melody_profile,
+    build_melody_suggestions,
+    build_lyric_suggestions,
+    build_progressions,
+    build_recognised_chords,
+    build_refinement_plan,
+    detect_mock_key,
+    melody_notes_to_events,
+)
+from backend.session import SessionManager, SessionNotFoundError
 from ml.lyrics_to_chords.service import generate_from_lyrics
 from ml.melody_sketchpad.service import generate_from_hum
 from ml.writers_block.service import generate_help
-from shared.schemas import GenerationResponse
+from shared.schemas import SessionState, SessionSummary
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 app = FastAPI(title="HumMuse API", version=APP_VERSION)
-logger = ExperimentLogger()
+database = Database()
+session_manager = SessionManager(database)
+experiment_logger = ExperimentLogger()
+request_logger = get_logger("backend.api")
+
+
+def _infer_pipeline_stage(endpoint: str) -> str:
+    if endpoint.startswith("/session/"):
+        if endpoint.endswith("/chat"):
+            return "explanation"
+        return "session"
+    if endpoint.startswith("/melody/"):
+        return "melody"
+    if endpoint.startswith("/chords/"):
+        return "harmony"
+    if endpoint.startswith("/suggest/") or endpoint.startswith("/writerblock/"):
+        return "lyrics"
+    if endpoint.startswith("/artifact/"):
+        return "storage"
+    return "api"
+
+
+def _infer_use_case(endpoint: str) -> str | None:
+    if endpoint == "/suggest/lyrics":
+        return "lyric"
+    if endpoint.endswith("/refine"):
+        return "refine"
+    if endpoint.endswith("/chat"):
+        return "explain"
+    return None
+
+
+def _extract_path_session_id(endpoint: str) -> str | None:
+    parts = [part for part in endpoint.split("/") if part]
+    if len(parts) >= 2 and parts[0] == "session":
+        return parts[1]
+    return None
+
+
+def _get_session_or_404(session_id: str) -> SessionState:
+    try:
+        return session_manager.get_session(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _save_session(state: SessionState) -> None:
+    session_manager.update_session(state.session_id, state)
+
+
+def _update_explanation_report(state: SessionState, *, source_action: str, summary: str, use_case: str | None = None) -> None:
+    state.explanation_report = build_explanation_report(
+        state,
+        source_action=source_action,
+        summary=summary,
+        use_case=use_case,
+    )
+    if state.explanation_report.decoding_traces:
+        database.record_decoding_trace(
+            str(state.session_id),
+            source_action,
+            json.dumps(state.explanation_report.decoding_traces),
+        )
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    endpoint = request.url.path
+    initialize_request_context(
+        request,
+        endpoint=endpoint,
+        pipeline_stage=_infer_pipeline_stage(endpoint),
+        session_id=_extract_path_session_id(endpoint),
+        use_case=_infer_use_case(endpoint),
+    )
+    started_at = time.perf_counter()
+    response = None
+    error_detail = None
+
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as exc:
+        error_detail = str(exc)
+        raise
+    finally:
+        latency_ms = round((time.perf_counter() - started_at) * 1000, 3)
+        context = get_request_context(request)
+        success = response is not None and response.status_code < 400 and error_detail is None
+        request_logger.info(
+            "request_completed",
+            **context,
+            latency_ms=latency_ms,
+            success=success,
+            error=error_detail or (None if response is None or success else f"http_{response.status_code}"),
+        )
 
 
 @app.get("/health")
@@ -35,69 +168,267 @@ def version() -> dict[str, str]:
     return {"version": APP_VERSION}
 
 
-@app.post("/melody/from-hum", response_model=GenerationResponse)
+@app.post("/session/create", response_model=SessionStateResponse)
+def create_session(request: Request, payload: SessionCreateRequest | None = None) -> SessionStateResponse:
+    request_payload = payload or SessionCreateRequest()
+    state = session_manager.create_session()
+    if request_payload.user_params:
+        state.user_params.update(request_payload.user_params)
+    if request_payload.lyrics_text:
+        state.lyrics_text = request_payload.lyrics_text
+    add_history(state, "session_created", {"user_params": bool(request_payload.user_params)})
+    _save_session(state)
+    bind_request_context(request, session_id=str(state.session_id), pipeline_stage="session")
+    return SessionStateResponse(state=state)
+
+
+@app.get("/session/{session_id}/state", response_model=SessionStateResponse)
+def get_session_state(request: Request, session_id: str) -> SessionStateResponse:
+    bind_request_context(request, session_id=session_id, pipeline_stage="session")
+    return SessionStateResponse(state=_get_session_or_404(session_id))
+
+
+@app.get("/sessions", response_model=list[SessionSummary])
+def list_sessions(request: Request) -> list[SessionSummary]:
+    bind_request_context(request, pipeline_stage="session")
+    return session_manager.list_sessions()
+
+
+@app.post("/melody/from-hum", response_model=MelodyFromHumResponse)
 async def melody_from_hum(
     request: Request,
     audio: UploadFile = File(...),
+    session_id: str | None = Form(default=None),
     prompt: str = Form("Melody sketch from humming"),
     mood: str | None = Form(default=None),
     tempo_bpm: int | None = Form(default=None),
-) -> GenerationResponse:
-    run_id = logger.start_run(
+) -> MelodyFromHumResponse:
+    bind_request_context(request, session_id=session_id, pipeline_stage="melody")
+    run_id = experiment_logger.start_run(
         "melody_from_hum",
-        metadata={"filename": audio.filename, "prompt": prompt, "mood": mood, "tempo_bpm": tempo_bpm},
+        metadata={
+            "filename": audio.filename,
+            "prompt": prompt,
+            "mood": mood,
+            "tempo_bpm": tempo_bpm,
+            "session_id": session_id,
+        },
     )
     try:
         audio_bytes = await audio.read()
         melody, chords, explanation, midi_bytes = generate_from_hum(audio_bytes, tempo_bpm)
+        note_events = melody_notes_to_events(melody)
+        melody_profile = build_melody_profile(note_events)
+        detected_tempo = float(tempo_bpm or 100)
+        chord_progressions = build_progressions([[chord.symbol for chord in chords]], mood or "uplift")
         base_url = str(request.base_url).rstrip("/")
 
-        midi_ref = logger.log_artifact(
+        midi_ref = experiment_logger.log_artifact(
             run_id,
             kind="midi",
             filename="melody.mid",
             payload=midi_bytes,
             base_url=base_url,
         )
-        chord_ref = logger.log_artifact(
+        chord_ref = experiment_logger.log_artifact(
             run_id,
             kind="chords",
             filename="chords.json",
             payload={"chords": [c.model_dump() for c in chords]},
             base_url=base_url,
         )
-        logger.finish_run(run_id)
-        return GenerationResponse(
-            run_id=run_id,
-            melody=melody,
-            chords=chords,
-            explanation=explanation,
+        experiment_logger.finish_run(run_id)
+
+        state = _get_session_or_404(session_id) if session_id else session_manager.create_session()
+        bind_request_context(request, session_id=str(state.session_id), pipeline_stage="melody")
+        state.melody_midi = midi_bytes
+        state.melody_notes = note_events
+        state.melody_profile = melody_profile
+        state.detected_key = detect_mock_key(mood)
+        state.detected_tempo = detected_tempo
+        state.chord_progressions = chord_progressions
+        add_history(
+            state,
+            "melody_uploaded",
+            {"filename": audio.filename or "audio", "tempo_bpm": tempo_bpm, "prompt": prompt},
+        )
+        _update_explanation_report(
+            state,
+            source_action="melody_from_hum",
+            summary="Mock melody extraction produced confidence-tagged notes and a session melody profile.",
+        )
+        _save_session(state)
+
+        return MelodyFromHumResponse(
+            session_id=state.session_id,
+            melody_notes=note_events,
+            melody_profile=melody_profile,
+            detected_key=state.detected_key,
+            detected_tempo=detected_tempo,
+            chord_progressions=chord_progressions,
             artifacts=[midi_ref, chord_ref],
+            run_id=run_id,
+            explanation=explanation,
         )
     except Exception as exc:  # pragma: no cover
-        logger.finish_run(run_id, error=exc)
+        experiment_logger.finish_run(run_id, error=exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/chords/from-lyrics", response_model=LyricsToChordsResponse)
-def chords_endpoint(payload: LyricsToChordsRequest) -> LyricsToChordsResponse:
+def chords_endpoint(request: Request, payload: LyricsToChordsRequest) -> LyricsToChordsResponse:
     mood, top_progressions, explanation = generate_from_lyrics(payload.text)
+    chord_progressions = build_progressions(top_progressions, mood)
+    bind_request_context(
+        request,
+        session_id=str(payload.session_id) if payload.session_id is not None else None,
+        pipeline_stage="harmony",
+    )
+    if payload.session_id is not None:
+        state = _get_session_or_404(str(payload.session_id))
+        state.lyrics_text = payload.text
+        state.emotion_vector = build_emotion_vector(mood)
+        state.chord_progressions = chord_progressions
+        add_history(state, "lyrics_analysed", {"mood": mood})
+        _update_explanation_report(
+            state,
+            source_action="chords_from_lyrics",
+            summary="Mock lyric analysis produced emotion-conditioned chord progression candidates.",
+        )
+        _save_session(state)
     return LyricsToChordsResponse(
         mood=mood,
         top_progressions=top_progressions,
+        chord_progressions=chord_progressions,
         explanation=explanation,
+        session_id=payload.session_id,
+    )
+
+
+@app.post("/chords/from-melody", response_model=ChordsFromMelodyResponse)
+def chords_from_melody(request: Request, payload: ChordsFromMelodyRequest) -> ChordsFromMelodyResponse:
+    bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="harmony")
+    state = _get_session_or_404(str(payload.session_id))
+    state.recognised_chords = build_recognised_chords(state)
+    add_history(state, "chords_recognised", {"count": len(state.recognised_chords)})
+    _update_explanation_report(
+        state,
+        source_action="chords_from_melody",
+        summary="Mock BACHI-style chord recognition produced ranked decoding traces for the active melody.",
+    )
+    _save_session(state)
+    return ChordsFromMelodyResponse(
+        session_id=state.session_id,
+        recognised_chords=state.recognised_chords,
+        explanation_report=state.explanation_report,
+    )
+
+
+@app.post("/melody/continue", response_model=MelodyContinueResponse)
+def continue_melody(request: Request, payload: MelodyContinueRequest) -> MelodyContinueResponse:
+    bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="melody")
+    state = _get_session_or_404(str(payload.session_id))
+    state.melody_suggestions = build_melody_suggestions(state, payload.num_suggestions)
+    add_history(state, "melody_continued", {"count": payload.num_suggestions})
+    _update_explanation_report(
+        state,
+        source_action="melody_continue",
+        summary="Mock continuation generated candidate phrases with simple coherence scores and constraint logs.",
+    )
+    _save_session(state)
+    return MelodyContinueResponse(
+        session_id=state.session_id,
+        melody_suggestions=state.melody_suggestions,
+    )
+
+
+@app.post("/suggest/lyrics", response_model=SuggestLyricsResponse)
+def suggest_lyrics(request: Request, payload: SuggestLyricsRequest) -> SuggestLyricsResponse:
+    bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="lyrics", use_case="lyric")
+    state = _get_session_or_404(str(payload.session_id))
+    state.lyric_suggestions = build_lyric_suggestions(state, payload.mode, payload.num_suggestions)
+    add_history(state, "lyrics_suggested", {"count": payload.num_suggestions, "mode": payload.mode})
+    _update_explanation_report(
+        state,
+        source_action="suggest_lyrics",
+        summary="Mock lyric suggestion generation used the active session context and lyric mode selector.",
+        use_case="lyric",
+    )
+    _save_session(state)
+    return SuggestLyricsResponse(
+        session_id=state.session_id,
+        lyric_suggestions=state.lyric_suggestions,
+    )
+
+
+@app.patch("/session/{session_id}/refine", response_model=SessionStateResponse)
+def refine_session(request: Request, session_id: str, payload: RefineSessionRequest) -> SessionStateResponse:
+    bind_request_context(request, session_id=session_id, pipeline_stage="session", use_case="refine")
+    state = _get_session_or_404(session_id)
+    refinement_plan = build_refinement_plan(payload.instruction, payload.target)
+    state.user_params["last_refinement"] = payload.instruction
+    state.user_params["last_refinement_target"] = payload.target or "session"
+    state.user_params["last_refinement_plan"] = refinement_plan.model_dump()
+    state.user_params["last_refinement_interpretation"] = refinement_plan.interpretation
+    add_history(
+        state,
+        "session_refined",
+        {"instruction": payload.instruction, "target": payload.target, "plan": refinement_plan.model_dump()},
+    )
+    _update_explanation_report(
+        state,
+        source_action="session_refine",
+        summary=refinement_plan.interpretation,
+        use_case="refine",
+    )
+    _save_session(state)
+    return SessionStateResponse(state=state)
+
+
+@app.post("/session/{session_id}/chat", response_model=SessionChatResponse)
+def session_chat(request: Request, session_id: str, payload: SessionChatRequest) -> SessionChatResponse:
+    bind_request_context(request, session_id=session_id, pipeline_stage="explanation", use_case="explain")
+    state = _get_session_or_404(session_id)
+    append_chat_message(state, "user", payload.message)
+    reply = build_chat_reply(state, payload.message)
+    state.chat_history.append(reply)
+    add_history(state, "session_chat", {"message": payload.message})
+    _update_explanation_report(
+        state,
+        source_action="session_chat",
+        summary="Mock explanation dialog grounded its response in the latest structured explanation report.",
+        use_case="explain",
+    )
+    _save_session(state)
+    return SessionChatResponse(
+        session_id=state.session_id,
+        reply=reply,
+        chat_history=state.chat_history,
+        explanation_report=state.explanation_report,
     )
 
 
 @app.post("/writerblock/help", response_model=WriterBlockHelpResponse)
-def writerblock_endpoint(payload: WriterBlockHelpRequest) -> WriterBlockHelpResponse:
+def writerblock_endpoint(request: Request, payload: WriterBlockHelpRequest) -> WriterBlockHelpResponse:
+    bind_request_context(request, pipeline_stage="lyrics")
     suggestions, explanation = generate_help(payload.text, payload.mood)
     return WriterBlockHelpResponse(suggestions=suggestions, explanation=explanation)
 
 
+@app.get("/artifact/{artifact_id}", response_model=ArtifactListingResponse)
+def get_artifact_listing(request: Request, artifact_id: str) -> ArtifactListingResponse:
+    bind_request_context(request, pipeline_stage="storage")
+    artifact_dir = experiment_logger.artifact_store.root_dir / artifact_id
+    if not artifact_dir.exists() or not artifact_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    files = sorted(path.name for path in artifact_dir.iterdir() if path.is_file())
+    return ArtifactListingResponse(artifact_id=artifact_id, files=files)
+
+
 @app.get("/artifact/{artifact_id}/{filename}")
-def get_artifact(artifact_id: str, filename: str) -> FileResponse:
-    path = logger.artifact_store.get_artifact_path(artifact_id, filename)
+def get_artifact(request: Request, artifact_id: str, filename: str) -> FileResponse:
+    bind_request_context(request, pipeline_stage="storage")
+    path = experiment_logger.artifact_store.get_artifact_path(artifact_id, filename)
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Artifact not found")
     media_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"

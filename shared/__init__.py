@@ -1,20 +1,47 @@
 """Shared package with cross-module schemas."""
 
 from shared.schemas import (
+    Action,
     ArtifactRef,
+    ChatMessage,
     ChordSuggestion,
+    ChordProgression,
+    EmotionVector,
+    ExplanationReport,
     ExplanationPart,
     GenerationRequest,
     GenerationResponse,
+    LyricSuggestion,
     MelodyNote,
+    MelodyProfile,
+    MelodySuggestion,
+    NoteEvent,
+    Progression,
+    RecognisedChord,
+    RefinementPlan,
+    SessionState,
+    SessionSummary,
 )
 
 __all__ = [
+    "Action",
     "ArtifactRef",
+    "ChatMessage",
     "MelodyNote",
+    "NoteEvent",
+    "MelodyProfile",
+    "EmotionVector",
+    "MelodySuggestion",
+    "LyricSuggestion",
+    "RecognisedChord",
+    "ChordProgression",
+    "Progression",
     "ChordSuggestion",
+    "RefinementPlan",
+    "ExplanationReport",
     "ExplanationPart",
     "GenerationRequest",
     "GenerationResponse",
+    "SessionState",
+    "SessionSummary",
 ]
-
