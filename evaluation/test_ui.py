@@ -5,8 +5,11 @@ from __future__ import annotations
 from ui.audio_utils import decode_midi_bytes, render_audio_from_session, synthesize_wave_from_notes
 from ui.app import (
     DEFAULT_API_URL,
+    artifact_by_kind,
     build_audio_file_tuple,
     confidence_to_color,
+    extract_pipeline_timings,
+    format_midi_pitch,
     format_session_option,
     note_rows,
     numbered_label,
@@ -68,12 +71,49 @@ def test_note_rows_keeps_expected_note_columns() -> None:
     assert rows == [
         {
             "pitch": 64,
+            "pitch_label": "E4 (64)",
             "onset": 0.0,
             "duration": 1.0,
             "velocity": 96,
             "confidence": 0.91,
         }
     ]
+
+
+def test_format_midi_pitch_returns_note_name_and_number() -> None:
+    assert format_midi_pitch(60) == "C4 (60)"
+    assert format_midi_pitch(69) == "A4 (69)"
+
+
+def test_artifact_by_kind_returns_matching_artifact() -> None:
+    artifacts = [
+        {"kind": "midi", "url": "http://localhost/melody.mid"},
+        {"kind": "timings", "url": "http://localhost/timings.json"},
+    ]
+
+    assert artifact_by_kind(artifacts, "timings") == {"kind": "timings", "url": "http://localhost/timings.json"}
+    assert artifact_by_kind(artifacts, "missing") is None
+
+
+def test_extract_pipeline_timings_fetches_timing_artifact(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_api_get_json_by_url(url: str) -> dict[str, object]:
+        captured["url"] = url
+        return {"step_latency_ms": {"decode_audio": 1.2}}
+
+    monkeypatch.setattr("ui.app.api_get_json_by_url", fake_api_get_json_by_url)
+
+    result = extract_pipeline_timings(
+        {
+            "artifacts": [
+                {"kind": "timings", "url": "http://localhost/artifact/timings.json"},
+            ]
+        }
+    )
+
+    assert result == {"step_latency_ms": {"decode_audio": 1.2}}
+    assert captured["url"] == "http://localhost/artifact/timings.json"
 
 
 def test_progression_helpers_format_cards_cleanly() -> None:

@@ -6,14 +6,13 @@ import re
 from datetime import UTC, datetime
 from typing import Iterable
 
+from ml.melody_sketchpad.notes import melody_notes_to_events, pitch_to_midi
 from shared.schemas import (
     Action,
     ChatMessage,
     EmotionVector,
     ExplanationReport,
     LyricSuggestion,
-    MelodyNote,
-    MelodyProfile,
     MelodySuggestion,
     NoteEvent,
     Progression,
@@ -21,96 +20,10 @@ from shared.schemas import (
     RefinementPlan,
     SessionState,
 )
-
-_PITCH_CLASS = {
-    "C": 0,
-    "C#": 1,
-    "Db": 1,
-    "D": 2,
-    "D#": 3,
-    "Eb": 3,
-    "E": 4,
-    "F": 5,
-    "F#": 6,
-    "Gb": 6,
-    "G": 7,
-    "G#": 8,
-    "Ab": 8,
-    "A": 9,
-    "A#": 10,
-    "Bb": 10,
-    "B": 11,
-}
+from ml.melody_sketchpad.profile import build_melody_profile
 
 _WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?", re.IGNORECASE)
 _VOWEL_GROUP_RE = re.compile(r"[aeiouy]+", re.IGNORECASE)
-
-
-def pitch_to_midi(pitch: str) -> int:
-    note = pitch[:-1]
-    octave = int(pitch[-1])
-    return (octave + 1) * 12 + _PITCH_CLASS[note]
-
-
-def melody_notes_to_events(notes: list[MelodyNote]) -> list[NoteEvent]:
-    return [
-        NoteEvent(
-            pitch=pitch_to_midi(note.pitch),
-            onset=note.start_beat,
-            duration=note.duration_beats,
-            velocity=note.velocity,
-            confidence=0.92,
-        )
-        for note in notes
-    ]
-
-
-def build_melody_profile(notes: list[NoteEvent]) -> MelodyProfile:
-    if not notes:
-        return MelodyProfile(
-            interval_histogram=[1.0, 0.0, 0.0, 0.0, 0.0],
-            rhythmic_density=0.0,
-            pitch_range=(0, 0),
-            contour="rising",
-        )
-
-    ordered = sorted(notes, key=lambda note: note.onset)
-    pitches = [note.pitch for note in ordered]
-    intervals = [curr - prev for prev, curr in zip(pitches, pitches[1:])]
-    buckets = [0, 0, 0, 0, 0]
-    for interval in intervals:
-        if interval <= -3:
-            buckets[0] += 1
-        elif interval < 0:
-            buckets[1] += 1
-        elif interval == 0:
-            buckets[2] += 1
-        elif interval < 3:
-            buckets[3] += 1
-        else:
-            buckets[4] += 1
-
-    total_intervals = sum(buckets) or 1
-    total_beats = max(note.onset + note.duration for note in ordered)
-    return MelodyProfile(
-        interval_histogram=[bucket / total_intervals for bucket in buckets],
-        rhythmic_density=len(ordered) / max(total_beats, 1.0),
-        pitch_range=(min(pitches), max(pitches)),
-        contour=classify_contour(pitches),
-    )
-
-
-def classify_contour(pitches: list[int]) -> str:
-    if len(pitches) < 3:
-        return "rising" if pitches[-1] >= pitches[0] else "falling"
-
-    peak = max(range(len(pitches)), key=pitches.__getitem__)
-    valley = min(range(len(pitches)), key=pitches.__getitem__)
-    if 0 < peak < len(pitches) - 1 and pitches[0] < pitches[peak] and pitches[-1] < pitches[peak]:
-        return "arch"
-    if 0 < valley < len(pitches) - 1 and pitches[0] > pitches[valley] and pitches[-1] > pitches[valley]:
-        return "valley"
-    return "rising" if pitches[-1] >= pitches[0] else "falling"
 
 
 def build_progressions(symbol_groups: Iterable[list[str]], mood: str) -> list[Progression]:
@@ -142,10 +55,6 @@ def build_emotion_vector(mood: str) -> EmotionVector:
         "neutral": EmotionVector(valence=0.0, arousal=0.3),
     }
     return presets.get(mood, EmotionVector(valence=0.1, arousal=0.4))
-
-
-def detect_mock_key(mood: str | None) -> str:
-    return "A minor" if (mood or "uplift").lower() == "melancholic" else "C major"
 
 
 def count_syllables(text: str) -> int:

@@ -23,6 +23,7 @@ dependencies = [
   "streamlit>=1.32,<2",
   "structlog>=24.4,<26",
   "librosa>=0.10,<1",
+  "MIDIUtil>=1.2.1,<2",
 ]
 
 [tool.setuptools]

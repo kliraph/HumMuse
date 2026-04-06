@@ -42,18 +42,15 @@ from backend.mock_pipeline import (
     build_chat_reply,
     build_emotion_vector,
     build_explanation_report,
-    build_melody_profile,
     build_melody_suggestions,
     build_lyric_suggestions,
     build_progressions,
     build_recognised_chords,
     build_refinement_plan,
-    detect_mock_key,
-    melody_notes_to_events,
 )
 from backend.session import SessionManager, SessionNotFoundError
 from ml.lyrics_to_chords.service import generate_from_lyrics
-from ml.melody_sketchpad.service import generate_from_hum
+from ml.melody_sketchpad.pipeline import run_melody_pipeline
 from ml.writers_block.service import generate_help
 from shared.schemas import SessionState, SessionSummary
 
@@ -216,35 +213,46 @@ async def melody_from_hum(
     )
     try:
         audio_bytes = await audio.read()
-        melody, chords, explanation, midi_bytes = generate_from_hum(audio_bytes, tempo_bpm)
-        note_events = melody_notes_to_events(melody)
-        melody_profile = build_melody_profile(note_events)
-        detected_tempo = float(tempo_bpm or 100)
-        chord_progressions = build_progressions([[chord.symbol for chord in chords]], mood or "uplift")
+        melody_result = run_melody_pipeline(audio_bytes, tempo_bpm=tempo_bpm, mood=mood)
+        melody = melody_result.melody
+        note_events = melody_result.note_events
+        melody_profile = melody_result.melody_profile
+        detected_tempo = melody_result.detected_tempo
+        chord_progressions = build_progressions([[chord.symbol for chord in melody_result.chords]], mood or "uplift")
         base_url = str(request.base_url).rstrip("/")
 
         midi_ref = experiment_logger.log_artifact(
             run_id,
             kind="midi",
             filename="melody.mid",
-            payload=midi_bytes,
+            payload=melody_result.midi_bytes,
             base_url=base_url,
         )
         chord_ref = experiment_logger.log_artifact(
             run_id,
             kind="chords",
             filename="chords.json",
-            payload={"chords": [c.model_dump() for c in chords]},
+            payload={"chords": [c.model_dump() for c in melody_result.chords]},
+            base_url=base_url,
+        )
+        timing_ref = experiment_logger.log_artifact(
+            run_id,
+            kind="timings",
+            filename="melody_pipeline_timings.json",
+            payload={
+                "step_latency_ms": melody_result.step_latency_ms,
+                "metadata": melody_result.metadata,
+            },
             base_url=base_url,
         )
         experiment_logger.finish_run(run_id)
 
         state = _get_session_or_404(session_id) if session_id else session_manager.create_session()
         bind_request_context(request, session_id=str(state.session_id), pipeline_stage="melody")
-        state.melody_midi = midi_bytes
+        state.melody_midi = melody_result.midi_bytes
         state.melody_notes = note_events
         state.melody_profile = melody_profile
-        state.detected_key = detect_mock_key(mood)
+        state.detected_key = melody_result.detected_key
         state.detected_tempo = detected_tempo
         state.chord_progressions = chord_progressions
         add_history(
@@ -266,9 +274,9 @@ async def melody_from_hum(
             detected_key=state.detected_key,
             detected_tempo=detected_tempo,
             chord_progressions=chord_progressions,
-            artifacts=[midi_ref, chord_ref],
+            artifacts=[midi_ref, chord_ref, timing_ref],
             run_id=run_id,
-            explanation=explanation,
+            explanation=melody_result.explanation,
         )
     except Exception as exc:  # pragma: no cover
         experiment_logger.finish_run(run_id, error=exc)

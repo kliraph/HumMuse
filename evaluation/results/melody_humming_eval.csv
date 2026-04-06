@@ -1,0 +1,11 @@
+sample_id,tempo_bpm,duration_seconds,expected_last_pitch,predicted_last_pitch,note_count_match,pitch_accuracy,onset_accuracy,duration_accuracy,velocity_accuracy,exact_match,used_audio_fallback,decode_audio_ms,preprocess_audio_ms,generate_notes_ms,quantize_notes_ms,smooth_notes_ms,build_profile_ms,export_midi_ms,assemble_outputs_ms
+sample_01,96,1.2,F4,F4,True,1.0,1.0,1.0,1.0,True,False,0.234,22.651,22.838,0.039,0.016,0.042,0.099,0.023
+sample_02,100,1.35,F4,F4,True,1.0,1.0,1.0,1.0,True,False,0.206,24.129,24.132,0.04,0.016,0.043,0.1,0.023
+sample_03,104,1.5,F4,F4,True,1.0,1.0,1.0,1.0,True,False,0.181,24.366,22.28,0.039,0.016,0.041,0.102,0.022
+sample_04,108,1.7,F4,F4,True,1.0,1.0,1.0,1.0,True,False,0.186,22.629,22.472,0.036,0.014,0.038,0.098,0.021
+sample_05,110,1.9,F4,F4,True,1.0,1.0,1.0,1.0,True,False,0.298,23.974,24.351,0.041,0.016,0.042,0.098,0.022
+sample_06,112,1.25,C5,C5,True,1.0,1.0,1.0,1.0,True,False,0.173,19.188,21.827,0.038,0.015,0.038,0.093,0.02
+sample_07,116,1.45,C5,C5,True,1.0,1.0,1.0,1.0,True,False,0.181,21.397,21.546,0.037,0.015,0.042,0.098,0.021
+sample_08,120,1.6,C5,C5,True,1.0,1.0,1.0,1.0,True,False,0.201,21.997,22.683,0.036,0.014,0.039,0.095,0.021
+sample_09,124,1.8,C5,C5,True,1.0,1.0,1.0,1.0,True,False,0.234,23.782,22.991,0.037,0.016,0.043,0.104,0.025
+sample_10,128,2.0,C5,C5,True,1.0,1.0,1.0,1.0,True,False,0.207,23.359,23.503,0.036,0.014,0.038,0.095,0.021
