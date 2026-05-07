@@ -9,13 +9,15 @@ import requests
 import streamlit as st
 
 try:
-    from ui.audio_utils import render_audio_from_session
+    from ui.audio_utils import decode_midi_bytes, render_audio_from_session
 except ModuleNotFoundError:  # pragma: no cover - script execution fallback
-    from audio_utils import render_audio_from_session
+    from audio_utils import decode_midi_bytes, render_audio_from_session
 
 
-DEFAULT_API_URL = "http://127.0.0.1:8000"
+DEFAULT_API_URL = os.environ.get("HUMMUSE_API_URL", "http://127.0.0.1:8000")
+SOUNDFONT_PATH = os.environ.get("HUMMUSE_SOUNDFONT", "")
 SUPPORTED_AUDIO_TYPES = ["wav", "webm", "mp3"]
+_PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
 
 def api_get(api_base_url: str, path: str) -> Any:
@@ -49,6 +51,12 @@ def api_post_multipart(
         data=data,
         timeout=30,
     )
+    response.raise_for_status()
+    return response.json()
+
+
+def api_get_json_by_url(url: str) -> Any:
+    response = requests.get(url, timeout=15)
     response.raise_for_status()
     return response.json()
 
@@ -102,6 +110,7 @@ def note_rows(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
             "pitch": note["pitch"],
+            "pitch_label": format_midi_pitch(int(note["pitch"])),
             "onset": note["onset"],
             "duration": note["duration"],
             "velocity": note["velocity"],
@@ -109,6 +118,26 @@ def note_rows(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for note in notes
     ]
+
+
+def format_midi_pitch(midi_pitch: int) -> str:
+    octave = (int(midi_pitch) // 12) - 1
+    note_name = _PITCH_CLASS_NAMES[int(midi_pitch) % 12]
+    return f"{note_name}{octave} ({int(midi_pitch)})"
+
+
+def artifact_by_kind(artifacts: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:
+    for artifact in artifacts:
+        if artifact.get("kind") == kind:
+            return artifact
+    return None
+
+
+def extract_pipeline_timings(response: dict[str, Any]) -> dict[str, Any] | None:
+    artifact = artifact_by_kind(response.get("artifacts", []), "timings")
+    if artifact is None or not artifact.get("url"):
+        return None
+    return api_get_json_by_url(str(artifact["url"]))
 
 
 def generate_chords_from_lyrics(
@@ -121,18 +150,6 @@ def generate_chords_from_lyrics(
         api_base_url,
         "/chords/from-lyrics",
         payload={"session_id": session_id, "text": lyrics_text},
-    )
-
-
-def recognise_chords_from_melody(
-    api_base_url: str,
-    *,
-    session_id: str,
-) -> dict[str, Any]:
-    return api_post(
-        api_base_url,
-        "/chords/from-melody",
-        payload={"session_id": session_id},
     )
 
 
@@ -195,14 +212,64 @@ def progression_title(progression: dict[str, Any]) -> str:
 
 
 def progression_caption(progression: dict[str, Any]) -> str:
-    score = progression.get("score")
+    model_confidence = progression.get("model_confidence", progression.get("score"))
+    mood_alignment = progression.get("mood_alignment")
     explanation = progression.get("explanation", "")
     harmonic_function = progression.get("harmonic_function")
     if harmonic_function:
         explanation = f"{harmonic_function} | {explanation}"
-    if score is None:
+    labels = []
+    if model_confidence is not None:
+        labels.append(f"Model confidence: {model_confidence:.2f}")
+    if mood_alignment is not None:
+        labels.append(f"Mood alignment: {mood_alignment:.2f}")
+    if not labels:
         return explanation
-    return f"Score: {score:.2f} | {explanation}"
+    return f"{' | '.join(labels)} | {explanation}"
+
+
+def top_pitch_class_probs(distribution: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    policy = distribution.get("policy", distribution)
+    pitch_class = policy.get("pitch_class", {})
+    ranked = sorted(pitch_class.items(), key=lambda item: item[1], reverse=True)
+    return [
+        {"pitch_class": name, "probability": round(float(probability), 4)}
+        for name, probability in ranked[:limit]
+    ]
+
+
+def render_progression_details(progression: dict[str, Any]) -> None:
+    annotations = progression.get("chord_annotations", [])
+    distributions = progression.get("native_distributions", [])
+    if annotations:
+        with st.expander("Derived chord-symbol annotations", expanded=False):
+            for annotation in annotations:
+                st.markdown(
+                    f"**{annotation['position'] + 1}. {annotation['symbol']}** "
+                    f"({annotation['roman_numeral']}, {annotation['function_label']})"
+                )
+                st.caption(
+                    f"Alignment: {annotation['alignment_percentage']:.2f} | "
+                    f"{annotation['template_phrase']}"
+                )
+                strong_notes = annotation.get("strong_beat_notes", [])
+                if strong_notes:
+                    st.json(strong_notes)
+    if distributions:
+        with st.expander("Chord head policy and Q-values", expanded=False):
+            for distribution in distributions:
+                policy = distribution.get("policy", distribution)
+                st.markdown(f"**Position {distribution['position'] + 1}**")
+                st.write(
+                    {
+                        "rest": policy.get("rest", {}),
+                        "octave": policy.get("octave", {}),
+                        "inversion": policy.get("inversion", {}),
+                        "q_margin": distribution.get("q_margin", {}),
+                        "emotion_bias": distribution.get("emotion_bias"),
+                        "top_pitch_classes": top_pitch_class_probs(distribution),
+                    }
+                )
 
 
 def numbered_label(index: int, text: str) -> str:
@@ -220,7 +287,7 @@ def confidence_to_color(confidence: float) -> str:
 def render_confidence_note_table(notes: list[dict[str, Any]]) -> None:
     rows = [
         "<tr>"
-        f"<td>{note['pitch']}</td>"
+        f"<td>{note['pitch_label']}</td>"
         f"<td>{note['onset']:.2f}</td>"
         f"<td>{note['duration']:.2f}</td>"
         f"<td>{note['velocity']}</td>"
@@ -234,8 +301,8 @@ def render_confidence_note_table(notes: list[dict[str, Any]]) -> None:
           <thead>
             <tr>
               <th style="text-align:left;">Pitch</th>
-              <th style="text-align:left;">Onset</th>
-              <th style="text-align:left;">Duration</th>
+              <th style="text-align:left;">Onset (beats)</th>
+              <th style="text-align:left;">Duration (beats)</th>
               <th style="text-align:left;">Velocity</th>
               <th style="text-align:left;">Confidence</th>
             </tr>
@@ -258,7 +325,6 @@ def format_session_option(session: dict[str, Any]) -> str:
 
 
 def ensure_session_defaults() -> None:
-    st.session_state.setdefault("api_base_url", DEFAULT_API_URL)
     st.session_state.setdefault("sessions_cache", [])
     st.session_state.setdefault("active_session_id", None)
     st.session_state.setdefault("active_session_state", None)
@@ -271,9 +337,10 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("chords_refine_text", "")
     st.session_state.setdefault("suggestions_refine_text", "")
     st.session_state.setdefault("explanations_chat_text", "")
-    st.session_state.setdefault("soundfont_path", os.environ.get("HUMMUSE_SOUNDFONT", ""))
     st.session_state.setdefault("melody_playback_audio", None)
     st.session_state.setdefault("melody_playback_source", None)
+    st.session_state.setdefault("latest_melody_result", None)
+    st.session_state.setdefault("latest_melody_timings", None)
 
 
 def clear_playback_cache() -> None:
@@ -296,8 +363,7 @@ def render_sidebar() -> None:
     st.sidebar.title("HumMuse")
     st.sidebar.caption("Session-first songwriting workspace")
 
-    api_base_url = st.sidebar.text_input("API base URL", key="api_base_url")
-    st.sidebar.text_input("SoundFont Path (Optional)", key="soundfont_path")
+    api_base_url = DEFAULT_API_URL
 
     col_a, col_b = st.sidebar.columns(2)
     if col_a.button("New Session", use_container_width=True):
@@ -420,15 +486,20 @@ def render_melody_tab() -> None:
     if st.button("Extract Melody", use_container_width=True, disabled=chosen_audio is None):
         try:
             response = extract_melody_from_audio(
-                st.session_state.api_base_url,
+                DEFAULT_API_URL,
                 session_id=state["session_id"],
                 uploaded_audio=chosen_audio,
                 prompt=st.session_state.melody_prompt,
                 mood=st.session_state.melody_mood,
                 tempo_bpm=int(st.session_state.melody_tempo),
             )
+            st.session_state.latest_melody_result = response
+            try:
+                st.session_state.latest_melody_timings = extract_pipeline_timings(response)
+            except requests.RequestException:
+                st.session_state.latest_melody_timings = None
             st.session_state.active_session_state = fetch_session_state(
-                st.session_state.api_base_url,
+                DEFAULT_API_URL,
                 response["session_id"],
             )
             clear_playback_cache()
@@ -450,18 +521,50 @@ def render_melody_tab() -> None:
         st.write("Melody profile")
         st.json(profile)
 
+    latest_result = st.session_state.latest_melody_result
+    if latest_result and latest_result.get("session_id") == state["session_id"]:
+        st.write("Latest extraction")
+        summary_a, summary_b, summary_c = st.columns(3)
+        summary_a.metric("Detected Key", latest_result.get("detected_key") or "Unknown")
+        tempo_value = latest_result.get("detected_tempo")
+        summary_b.metric("Detected Tempo", f"{tempo_value:.1f} BPM" if tempo_value is not None else "Unknown")
+        summary_c.metric("Returned Notes", len(latest_result.get("melody_notes", [])))
+
+        explanation = latest_result.get("explanation", [])
+        if explanation:
+            for part in explanation:
+                with st.container(border=True):
+                    st.markdown(f"**{part['title']}**")
+                    st.write(part["detail"])
+
+        timings = st.session_state.latest_melody_timings
+        if timings:
+            st.write("Pipeline timings")
+            st.json(timings)
+
     if state.get("melody_midi") or state.get("melody_notes"):
-        if st.button("Play Melody", use_container_width=True):
+        actions_left, actions_right = st.columns(2)
+        if actions_left.button("Play Melody", use_container_width=True):
             try:
                 audio_bytes, source = render_audio_from_session(
                     state,
-                    soundfont_path=st.session_state.soundfont_path.strip() or None,
+                    soundfont_path=SOUNDFONT_PATH or None,
                 )
                 st.session_state.melody_playback_audio = audio_bytes
                 st.session_state.melody_playback_source = source
                 st.success(f"Rendered playback using {source}.")
             except Exception as exc:  # pragma: no cover - UI feedback path
                 st.error(f"Could not render playback: {exc}")
+
+        midi_bytes = decode_midi_bytes(state.get("melody_midi"))
+        if midi_bytes:
+            actions_right.download_button(
+                "Download MIDI",
+                data=midi_bytes,
+                file_name="melody.mid",
+                mime="audio/midi",
+                use_container_width=True,
+            )
 
         if st.session_state.melody_playback_audio:
             st.audio(st.session_state.melody_playback_audio, format="audio/wav")
@@ -479,82 +582,43 @@ def render_chords_tab() -> None:
         st.write("Chord generation will use the active session once selected.")
         return
 
-    melody_column, lyric_column = st.columns(2)
+    st.markdown("**Generate chords from lyrics**")
+    lyrics_default = state.get("lyrics_text") or st.session_state.lyrics_input
+    lyrics_text = st.text_area(
+        "Lyrics",
+        value=lyrics_default,
+        key="lyrics_input",
+        height=160,
+        placeholder="Type or paste your lyrics here, then generate candidate progressions.",
+    )
 
-    with melody_column:
-        st.markdown("**Recognise from melody**")
-        st.caption("Use the current melody notes in the active session to produce mock recognised chords.")
-        if st.button(
-            "Recognise Chords From Melody",
-            use_container_width=True,
-            disabled=not state.get("melody_notes"),
-        ):
-            try:
-                response = recognise_chords_from_melody(
-                    st.session_state.api_base_url,
-                    session_id=state["session_id"],
-                )
-                st.session_state.active_session_state = fetch_session_state(
-                    st.session_state.api_base_url,
-                    state["session_id"],
-                )
-                state = st.session_state.active_session_state
-                st.success(f"Recognised {len(response['recognised_chords'])} chord spans from the melody.")
-            except requests.RequestException as exc:
-                st.error(f"Could not recognise chords from melody: {exc}")
+    if st.button("Generate Chords", use_container_width=True, disabled=not lyrics_text.strip()):
+        try:
+            response = generate_chords_from_lyrics(
+                DEFAULT_API_URL,
+                session_id=state["session_id"],
+                lyrics_text=lyrics_text.strip(),
+            )
+            st.session_state.active_session_state = fetch_session_state(
+                DEFAULT_API_URL,
+                state["session_id"],
+            )
+            state = st.session_state.active_session_state
+            st.success(
+                f"Generated {len(response['chord_progressions'])} candidate progressions for a {response['mood']} mood."
+            )
+        except requests.RequestException as exc:
+            st.error(f"Could not generate chords: {exc}")
 
-        recognised_chords = state.get("recognised_chords", [])
-        if recognised_chords:
-            for chord in recognised_chords:
-                with st.container(border=True):
-                    st.markdown(f"**{chord['symbol']}**")
-                    st.caption(
-                        f"Beats {chord['start_beat']:.1f}-{chord['start_beat'] + chord['duration_beats']:.1f} | "
-                        f"Confidence: {chord['confidence']:.2f} | {chord.get('harmonic_function') or 'function pending'}"
-                    )
-                    if chord.get("decoding_trace"):
-                        with st.expander("Decoding trace"):
-                            st.json(chord["decoding_trace"])
-        else:
-            st.caption("No recognised chords yet.")
-
-    with lyric_column:
-        st.markdown("**Generate from lyrics**")
-        lyrics_default = state.get("lyrics_text") or st.session_state.lyrics_input
-        lyrics_text = st.text_area(
-            "Lyrics",
-            value=lyrics_default,
-            key="lyrics_input",
-            height=160,
-            placeholder="Type or paste your lyrics here, then generate candidate progressions.",
-        )
-
-        if st.button("Generate Chords", use_container_width=True, disabled=not lyrics_text.strip()):
-            try:
-                response = generate_chords_from_lyrics(
-                    st.session_state.api_base_url,
-                    session_id=state["session_id"],
-                    lyrics_text=lyrics_text.strip(),
-                )
-                st.session_state.active_session_state = fetch_session_state(
-                    st.session_state.api_base_url,
-                    state["session_id"],
-                )
-                state = st.session_state.active_session_state
-                st.success(
-                    f"Generated {len(response['chord_progressions'])} candidate progressions for a {response['mood']} mood."
-                )
-            except requests.RequestException as exc:
-                st.error(f"Could not generate chords: {exc}")
-
-        progressions = state.get("chord_progressions", [])
-        if progressions:
-            for progression in progressions:
-                with st.container(border=True):
-                    st.markdown(f"**{progression_title(progression)}**")
-                    st.caption(progression_caption(progression))
-        else:
-            st.caption("No lyric-driven chord progressions yet.")
+    progressions = state.get("chord_progressions", [])
+    if progressions:
+        for progression in progressions:
+            with st.container(border=True):
+                st.markdown(f"**{progression_title(progression)}**")
+                st.caption(progression_caption(progression))
+                render_progression_details(progression)
+    else:
+        st.caption("No chord progressions yet.")
 
     render_refinement_panel("chords")
 
@@ -573,11 +637,11 @@ def render_suggestions_tab() -> None:
         if st.button("Generate Melody Continuations", use_container_width=True):
             try:
                 response = request_melody_suggestions(
-                    st.session_state.api_base_url,
+                    DEFAULT_API_URL,
                     session_id=state["session_id"],
                 )
                 st.session_state.active_session_state = fetch_session_state(
-                    st.session_state.api_base_url,
+                    DEFAULT_API_URL,
                     state["session_id"],
                 )
                 state = st.session_state.active_session_state
@@ -598,11 +662,11 @@ def render_suggestions_tab() -> None:
         if st.button("Generate Lyric Suggestions", use_container_width=True):
             try:
                 response = request_lyric_suggestions(
-                    st.session_state.api_base_url,
+                    DEFAULT_API_URL,
                     session_id=state["session_id"],
                 )
                 st.session_state.active_session_state = fetch_session_state(
-                    st.session_state.api_base_url,
+                    DEFAULT_API_URL,
                     state["session_id"],
                 )
                 state = st.session_state.active_session_state
@@ -659,12 +723,12 @@ def render_explanations_tab() -> None:
         if st.button("Send Question", use_container_width=True, disabled=not prompt.strip()):
             try:
                 response = send_chat_message(
-                    st.session_state.api_base_url,
+                    DEFAULT_API_URL,
                     session_id=state["session_id"],
                     message=prompt.strip(),
                 )
                 st.session_state.active_session_state = fetch_session_state(
-                    st.session_state.api_base_url,
+                    DEFAULT_API_URL,
                     state["session_id"],
                 )
                 st.session_state.explanations_chat_text = ""
@@ -690,7 +754,7 @@ def render_refinement_panel(target: str) -> None:
     if st.button(f"Refine {target.title()}", key=f"refine_{target}", use_container_width=True, disabled=not instruction.strip()):
         try:
             response = refine_session(
-                st.session_state.api_base_url,
+                DEFAULT_API_URL,
                 session_id=state["session_id"],
                 instruction=instruction.strip(),
                 target=target,
@@ -711,7 +775,7 @@ def main() -> None:
 
     if st.session_state.active_session_id and st.button("Refresh Active Session"):
         try:
-            sync_active_session(st.session_state.api_base_url)
+            sync_active_session(DEFAULT_API_URL)
             st.success("Session refreshed")
         except requests.RequestException as exc:
             st.error(f"Could not refresh session: {exc}")

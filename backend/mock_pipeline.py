@@ -16,7 +16,6 @@ from shared.schemas import (
     MelodySuggestion,
     NoteEvent,
     Progression,
-    RecognisedChord,
     RefinementPlan,
     SessionState,
 )
@@ -121,42 +120,6 @@ def build_lyric_suggestions(state: SessionState, mode: str, count: int = 3) -> l
     ]
 
 
-def build_recognised_chords(state: SessionState) -> list[RecognisedChord]:
-    start_points = [0.0, 2.0, 4.0]
-    symbols = ["Am", "F", "G"]
-    functions = ["tonic substitute", "predominant", "dominant"]
-    recognised: list[RecognisedChord] = []
-    for index, symbol in enumerate(symbols):
-        recognised.append(
-            RecognisedChord(
-                symbol=symbol,
-                start_beat=start_points[index],
-                duration_beats=2.0,
-                confidence=max(0.62, 0.86 - (index * 0.08)),
-                harmonic_function=functions[index],
-                explanation=f"Mock BACHI-style decoding favoured {symbol} from the strongest melody tones in this span.",
-                decoding_trace=[
-                    {
-                        "step": "boundary",
-                        "confidence": round(0.88 - (index * 0.05), 2),
-                        "alternatives": ["hold", "split"],
-                    },
-                    {
-                        "step": "root",
-                        "winner": symbol[0],
-                        "alternatives": [symbol[0], "C", "E"],
-                    },
-                    {
-                        "step": "quality",
-                        "winner": symbol[1:] or "maj",
-                        "alternatives": [symbol[1:] or "maj", "7", "sus2"],
-                    },
-                ],
-            )
-        )
-    return recognised
-
-
 def build_refinement_plan(instruction: str, target: str | None = None) -> RefinementPlan:
     lowered = instruction.lower()
     target_pipeline = "session"
@@ -203,15 +166,6 @@ def build_explanation_report(
         }
         for note in state.melody_notes
     ]
-    decoding_traces = [
-        {
-            "symbol": chord.symbol,
-            "start_beat": chord.start_beat,
-            "confidence": chord.confidence,
-            "trace": chord.decoding_trace,
-        }
-        for chord in state.recognised_chords
-    ]
     constraint_logs = [
         {
             "candidate": index + 1,
@@ -226,6 +180,11 @@ def build_explanation_report(
             "progression": progression.chords,
             "harmonic_function": progression.harmonic_function,
             "explanation": progression.explanation,
+            "annotations": [
+                annotation.model_dump()
+                for annotation in progression.chord_annotations
+            ],
+            "native_distribution_count": len(progression.native_distributions),
         }
         for progression in state.chord_progressions
     ]
@@ -239,7 +198,6 @@ def build_explanation_report(
         source_action=source_action,
         summary=summary,
         melody_confidence=melody_confidence,
-        decoding_traces=decoding_traces,
         constraint_logs=constraint_logs,
         chord_theory=chord_theory,
         emotion_mapping=emotion_mapping,
@@ -254,9 +212,16 @@ def build_chat_reply(state: SessionState, message: str) -> ChatMessage:
         else "There is no explanation report yet, so this response stays at the session-summary level."
     )
     chord_detail = ""
-    if state.recognised_chords:
-        chord = state.recognised_chords[0]
-        chord_detail = f" The current trace starts with {chord.symbol} at beat {chord.start_beat:.1f}."
+    if state.chord_progressions:
+        progression = state.chord_progressions[0]
+        if progression.chord_annotations:
+            annotation = progression.chord_annotations[0]
+            chord_detail = (
+                f" The first generated chord is {annotation.symbol} "
+                f"({annotation.roman_numeral}, {annotation.function_label})."
+            )
+        elif progression.chords:
+            chord_detail = f" The current top progression starts with {progression.chords[0]}."
     return ChatMessage(
         role="assistant",
         content=f"{summary} In response to '{message}', the stub explanation stays grounded in the current session data.{chord_detail}",

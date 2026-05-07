@@ -208,5 +208,6 @@ __marimo__/
 
 # HumMuse runtime storage
 storage/artifacts/
+storage/models/
 storage/*.db
 !storage/.gitkeep

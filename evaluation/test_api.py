@@ -94,13 +94,6 @@ def test_task_1_4_api_flow() -> None:
     assert chords.status_code == 200
     assert len(chords.json()["chord_progressions"]) == 3
 
-    recognise = client.post("/chords/from-melody", json={"session_id": session_id})
-    assert recognise.status_code == 200
-    recognise_body = recognise.json()
-    assert recognise_body["session_id"] == session_id
-    assert len(recognise_body["recognised_chords"]) == 3
-    assert recognise_body["explanation_report"]["source_action"] == "chords_from_melody"
-
     continuation = client.post("/melody/continue", json={"session_id": session_id, "num_suggestions": 3})
     assert continuation.status_code == 200
     assert len(continuation.json()["melody_suggestions"]) == 3
@@ -134,7 +127,7 @@ def test_task_1_4_api_flow() -> None:
     final_state = client.get(f"/session/{session_id}/state")
     assert final_state.status_code == 200
     body = final_state.json()["state"]
-    assert len(body["recognised_chords"]) == 3
+    assert len(body["chord_progressions"]) == 3
     assert len(body["melody_suggestions"]) == 3
     assert len(body["lyric_suggestions"]) == 3
     assert len(body["chat_history"]) == 2

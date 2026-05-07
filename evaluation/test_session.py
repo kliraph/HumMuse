@@ -21,7 +21,6 @@ from shared.schemas import (
     MelodySuggestion,
     NoteEvent,
     Progression,
-    RecognisedChord,
     SessionState,
 )
 
@@ -50,17 +49,6 @@ def _build_state(session_id: str) -> SessionState:
         ),
         detected_key="C major",
         detected_tempo=118.0,
-        recognised_chords=[
-            RecognisedChord(
-                symbol="Am",
-                start_beat=0.0,
-                duration_beats=2.0,
-                confidence=0.83,
-                harmonic_function="tonic substitute",
-                explanation="Strong A and C emphasis in the melody.",
-                decoding_trace=[{"step": "root", "winner": "A"}],
-            )
-        ],
         chord_progressions=[
             Progression(
                 chords=["C", "G", "Am", "F"],
@@ -90,7 +78,6 @@ def _build_state(session_id: str) -> SessionState:
             source_action="test_seed",
             summary="Test explanation report",
             melody_confidence=[{"pitch": 64, "confidence": 0.98}],
-            decoding_traces=[{"step": "root", "winner": "A"}],
             constraint_logs=[{"candidate": 1, "status": "accepted"}],
             chord_theory=[{"progression": ["C", "G", "Am", "F"]}],
             emotion_mapping={"valence": 0.72, "arousal": 0.44},
@@ -130,11 +117,11 @@ def test_database_initializes_expected_tables(local_tmp_path: Path) -> None:
             """
             SELECT name
             FROM sqlite_master
-            WHERE type = 'table' AND name IN ('sessions', 'api_cache', 'metrics', 'decoding_traces')
+            WHERE type = 'table' AND name IN ('sessions', 'api_cache', 'metrics')
             """
         ).fetchall()
 
-    assert {row[0] for row in rows} == {"sessions", "api_cache", "metrics", "decoding_traces"}
+    assert {row[0] for row in rows} == {"sessions", "api_cache", "metrics"}
 
 
 def test_session_manager_round_trip_preserves_all_fields(local_tmp_path: Path) -> None:
@@ -163,7 +150,7 @@ def test_list_sessions_returns_summary_metadata(local_tmp_path: Path) -> None:
 
     assert len(summaries) == 1
     assert summaries[0].session_id == created.session_id
-    assert summaries[0].pipeline_version == "v3.1"
+    assert summaries[0].pipeline_version == "v3.3"
 
 
 def test_missing_session_raises_not_found(local_tmp_path: Path) -> None:

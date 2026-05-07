@@ -17,7 +17,6 @@ from shared.schemas import (
     MelodySuggestion,
     NoteEvent,
     Progression,
-    RecognisedChord,
     SessionState,
 )
 
@@ -50,16 +49,6 @@ class LyricsToChordsResponse(BaseModel):
     chord_progressions: list[Progression] = Field(default_factory=list)
     explanation: list[ExplanationPart] = Field(default_factory=list)
     session_id: UUID | None = None
-
-
-class ChordsFromMelodyRequest(BaseModel):
-    session_id: UUID
-
-
-class ChordsFromMelodyResponse(BaseModel):
-    session_id: UUID
-    recognised_chords: list[RecognisedChord] = Field(default_factory=list)
-    explanation_report: ExplanationReport | None = None
 
 
 class MelodyContinueRequest(BaseModel):

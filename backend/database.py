@@ -60,18 +60,7 @@ class Database:
                 """
             )
             self._migrate_api_cache_table(conn)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS decoding_traces (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  session_id TEXT NOT NULL,
-                  pipeline_stage TEXT NOT NULL,
-                  trace_json TEXT NOT NULL,
-                  timestamp TEXT NOT NULL,
-                  FOREIGN KEY(session_id) REFERENCES sessions(id)
-                )
-                """
-            )
+            conn.execute("DROP TABLE IF EXISTS decoding_traces")
 
     def _migrate_api_cache_table(self, conn: sqlite3.Connection) -> None:
         columns = {
@@ -179,17 +168,6 @@ class Database:
         if row is None:
             return None
         return str(row[0])
-
-    def record_decoding_trace(self, session_id: str, pipeline_stage: str, trace_json: str) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO decoding_traces(session_id, pipeline_stage, trace_json, timestamp)
-                VALUES(?, ?, ?, ?)
-                """
-                ,
-                (session_id, pipeline_stage, trace_json, _now_iso()),
-            )
 
     def record_metric(
         self,

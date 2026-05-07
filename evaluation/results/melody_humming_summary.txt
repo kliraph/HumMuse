@@ -1,5 +1,5 @@
 samples=10
 exact_match_rate=1.000
 average_pitch_accuracy=1.000
-average_total_latency_ms=46.033
+average_total_latency_ms=109.510
 csv=evaluation/results/melody_humming_eval.csv

@@ -74,9 +74,21 @@ def run() -> None:
     )
     assert melody_session.status_code == 200
 
-    recognised = client.post("/chords/from-melody", json={"session_id": session_id})
-    assert recognised.status_code == 200
-    assert len(recognised.json()["recognised_chords"]) == 3
+    dqn_chords = client.post(
+        "/chords/from-lyrics",
+        json={"session_id": session_id, "text": "Love under the sunrise"},
+    )
+    assert dqn_chords.status_code == 200
+    progression = dqn_chords.json()["chord_progressions"][0]
+    distribution = progression["native_distributions"][0]
+    annotation = progression["chord_annotations"][0]
+    explanation = progression["chord_explanations"][0]
+    assert distribution["q_margin"]["pitch_class"] >= 0.0
+    assert distribution["reward_attribution"]["harmony_rule"] is not None
+    assert annotation["q_margin"] is not None
+    assert annotation["value_score"] is not None
+    assert explanation["reward_components"]["harmony_rule"] is not None
+    assert explanation["margin"] >= 0.0
 
     chat = client.post(f"/session/{session_id}/chat", json={"message": "Why this harmony?"})
     assert chat.status_code == 200

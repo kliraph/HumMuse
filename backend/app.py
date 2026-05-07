@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import mimetypes
 import time
 
@@ -11,8 +10,6 @@ from fastapi.responses import FileResponse
 
 from backend.api_models import (
     ArtifactListingResponse,
-    ChordsFromMelodyRequest,
-    ChordsFromMelodyResponse,
     LyricsToChordsRequest,
     LyricsToChordsResponse,
     MelodyContinueRequest,
@@ -45,10 +42,10 @@ from backend.mock_pipeline import (
     build_melody_suggestions,
     build_lyric_suggestions,
     build_progressions,
-    build_recognised_chords,
     build_refinement_plan,
 )
 from backend.session import SessionManager, SessionNotFoundError
+from ml.harmony import generate_chords as generate_dqn_chords
 from ml.lyrics_to_chords.service import generate_from_lyrics
 from ml.melody_sketchpad.pipeline import run_melody_pipeline
 from ml.writers_block.service import generate_help
@@ -114,12 +111,6 @@ def _update_explanation_report(state: SessionState, *, source_action: str, summa
         summary=summary,
         use_case=use_case,
     )
-    if state.explanation_report.decoding_traces:
-        database.record_decoding_trace(
-            str(state.session_id),
-            source_action,
-            json.dumps(state.explanation_report.decoding_traces),
-        )
 
 
 @app.middleware("http")
@@ -286,7 +277,6 @@ async def melody_from_hum(
 @app.post("/chords/from-lyrics", response_model=LyricsToChordsResponse)
 def chords_endpoint(request: Request, payload: LyricsToChordsRequest) -> LyricsToChordsResponse:
     mood, top_progressions, explanation = generate_from_lyrics(payload.text)
-    chord_progressions = build_progressions(top_progressions, mood)
     bind_request_context(
         request,
         session_id=str(payload.session_id) if payload.session_id is not None else None,
@@ -294,16 +284,29 @@ def chords_endpoint(request: Request, payload: LyricsToChordsRequest) -> LyricsT
     )
     if payload.session_id is not None:
         state = _get_session_or_404(str(payload.session_id))
+        emotion_vector = build_emotion_vector(mood)
+        chord_progressions = _generate_chord_progressions_for_state(state, mood, top_progressions, emotion_vector)
         state.lyrics_text = payload.text
-        state.emotion_vector = build_emotion_vector(mood)
+        state.emotion_vector = emotion_vector
         state.chord_progressions = chord_progressions
-        add_history(state, "lyrics_analysed", {"mood": mood})
+        add_history(
+            state,
+            "lyrics_analysed",
+            {
+                "mood": mood,
+                "source": "dqn" if state.melody_notes else "mock",
+                "progression_count": len(chord_progressions),
+            },
+        )
         _update_explanation_report(
             state,
             source_action="chords_from_lyrics",
-            summary="Mock lyric analysis produced emotion-conditioned chord progression candidates.",
+            summary="Lyric analysis produced emotion-conditioned DQN chord progression candidates.",
         )
         _save_session(state)
+        top_progressions = [progression.chords for progression in chord_progressions]
+    else:
+        chord_progressions = build_progressions(top_progressions, mood)
     return LyricsToChordsResponse(
         mood=mood,
         top_progressions=top_progressions,
@@ -313,22 +316,20 @@ def chords_endpoint(request: Request, payload: LyricsToChordsRequest) -> LyricsT
     )
 
 
-@app.post("/chords/from-melody", response_model=ChordsFromMelodyResponse)
-def chords_from_melody(request: Request, payload: ChordsFromMelodyRequest) -> ChordsFromMelodyResponse:
-    bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="harmony")
-    state = _get_session_or_404(str(payload.session_id))
-    state.recognised_chords = build_recognised_chords(state)
-    add_history(state, "chords_recognised", {"count": len(state.recognised_chords)})
-    _update_explanation_report(
-        state,
-        source_action="chords_from_melody",
-        summary="Mock BACHI-style chord recognition produced ranked decoding traces for the active melody.",
-    )
-    _save_session(state)
-    return ChordsFromMelodyResponse(
-        session_id=state.session_id,
-        recognised_chords=state.recognised_chords,
-        explanation_report=state.explanation_report,
+def _generate_chord_progressions_for_state(
+    state: SessionState,
+    mood: str,
+    fallback_progressions: list[list[str]],
+    emotion_vector,
+) -> list:
+    if not state.melody_notes:
+        return build_progressions(fallback_progressions, mood)
+    return generate_dqn_chords(
+        state.melody_notes,
+        key=state.detected_key or "C major",
+        emotion_vector=emotion_vector,
+        top_k=3,
+        tempo_bpm=state.detected_tempo or 120.0,
     )
 
 

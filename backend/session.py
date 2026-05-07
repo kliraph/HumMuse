@@ -13,7 +13,7 @@ class SessionNotFoundError(KeyError):
 
 
 class SessionManager:
-    def __init__(self, database: Database | None = None, *, pipeline_version: str = "v3.1") -> None:
+    def __init__(self, database: Database | None = None, *, pipeline_version: str = "v3.3") -> None:
         self.database = database or Database()
         self.pipeline_version = pipeline_version
 

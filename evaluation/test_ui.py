@@ -125,7 +125,7 @@ def test_progression_helpers_format_cards_cleanly() -> None:
     }
 
     assert progression_title(progression) == "Am -> F -> C -> G"
-    assert progression_caption(progression) == "Score: 0.88 | predominant lift | Stable pop cadence with a reflective color."
+    assert progression_caption(progression) == "Model confidence: 0.88 | predominant lift | Stable pop cadence with a reflective color."
 
 
 def test_numbered_label_formats_options_for_suggestions() -> None:

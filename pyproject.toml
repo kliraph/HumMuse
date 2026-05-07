@@ -24,6 +24,9 @@ dependencies = [
   "structlog>=24.4,<26",
   "librosa>=0.10,<1",
   "MIDIUtil>=1.2.1,<2",
+  "miditok>=3,<4",
+  "python-dotenv>=1,<2",
+  "torch>=2,<3",
 ]
 
 [tool.setuptools]
