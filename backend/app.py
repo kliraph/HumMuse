@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import mimetypes
 import time
+from io import BytesIO
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
+from midiutil import MIDIFile
 
 from backend.api_models import (
     ArtifactListingResponse,
+    ChordsManualRequest,
+    ChordsManualResponse,
     LyricsToChordsRequest,
     LyricsToChordsResponse,
+    MelodyAcceptRequest,
     MelodyContinueRequest,
     MelodyContinueResponse,
     MelodyFromHumResponse,
@@ -39,17 +44,19 @@ from backend.mock_pipeline import (
     build_chat_reply,
     build_emotion_vector,
     build_explanation_report,
-    build_melody_suggestions,
     build_lyric_suggestions,
     build_progressions,
     build_refinement_plan,
 )
 from backend.session import SessionManager, SessionNotFoundError
 from ml.harmony import generate_chords as generate_dqn_chords
+from ml.melody_sketchpad.continuation.constraints import chord_symbol_to_pitch_classes
 from ml.lyrics_to_chords.service import generate_from_lyrics
+from ml.melody_sketchpad.continuation.pipeline import continue_melody as run_continuation_pipeline
 from ml.melody_sketchpad.pipeline import run_melody_pipeline
+from ml.melody_sketchpad.profile import build_melody_profile
 from ml.writers_block.service import generate_help
-from shared.schemas import SessionState, SessionSummary
+from shared.schemas import ChordProgression, MelodySuggestion, NoteEvent, SessionState, SessionSummary
 
 APP_VERSION = "0.3.0"
 
@@ -111,6 +118,43 @@ def _update_explanation_report(state: SessionState, *, source_action: str, summa
         summary=summary,
         use_case=use_case,
     )
+
+
+def _append_continuation_notes(state: SessionState, suggestion: MelodySuggestion) -> list[NoteEvent]:
+    current_end = max((note.onset + note.duration for note in state.melody_notes), default=0.0)
+    first_onset = min(note.onset for note in suggestion.notes)
+    appended = [
+        NoteEvent(
+            pitch=note.pitch,
+            onset=current_end + max(0.0, note.onset - first_onset),
+            duration=note.duration,
+            velocity=note.velocity,
+            confidence=note.confidence,
+        )
+        for note in suggestion.notes
+    ]
+    state.melody_notes = [*state.melody_notes, *appended]
+    state.melody_profile = build_melody_profile(state.melody_notes)
+    state.melody_midi = _note_events_to_midi_bytes(state.melody_notes, tempo_bpm=int(state.detected_tempo or 120))
+    return appended
+
+
+def _note_events_to_midi_bytes(notes: list[NoteEvent], *, tempo_bpm: int) -> bytes:
+    midi = MIDIFile(1, deinterleave=False)
+    midi.addTrackName(0, 0, "HumMuse melody")
+    midi.addTempo(0, 0, int(tempo_bpm))
+    for note in sorted(notes, key=lambda item: (item.onset, item.duration, item.pitch)):
+        midi.addNote(
+            track=0,
+            channel=0,
+            pitch=int(note.pitch),
+            time=float(note.onset),
+            duration=float(note.duration),
+            volume=int(note.velocity),
+        )
+    buffer = BytesIO()
+    midi.writeFile(buffer)
+    return buffer.getvalue()
 
 
 @app.middleware("http")
@@ -333,22 +377,157 @@ def _generate_chord_progressions_for_state(
     )
 
 
+@app.post("/chords/manual", response_model=ChordsManualResponse)
+def chords_manual_endpoint(request: Request, payload: ChordsManualRequest) -> ChordsManualResponse:
+    """Replace the session's chord progression with a user-supplied list.
+
+    The progression is stored with `score=1.0` and `explanation="User-supplied
+    progression."` so the Phase 5 chord-consonance constraint picks it up
+    exactly like a DQN-accepted progression. We bypass the DQN/lyric pathway
+    entirely — there is no mood inference and no model confidence to record.
+    """
+    bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="harmony")
+    cleaned: list[str] = []
+    rejected: list[str] = []
+    for symbol in payload.chords:
+        cleaned_symbol = symbol.strip()
+        if not cleaned_symbol:
+            continue
+        # chord_symbol_to_pitch_classes returns an empty set for anything it
+        # cannot parse (unknown root, malformed suffix). That is exactly the
+        # signal the constraint check would use downstream, so use it as the
+        # validator here too — keep contracts in lock-step.
+        if not chord_symbol_to_pitch_classes(cleaned_symbol):
+            rejected.append(cleaned_symbol)
+            continue
+        cleaned.append(cleaned_symbol)
+    if rejected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unparseable chord symbol(s): {', '.join(rejected)}",
+        )
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="At least one chord symbol is required")
+
+    state = _get_session_or_404(str(payload.session_id))
+    progression = ChordProgression(
+        chords=cleaned,
+        score=1.0,
+        explanation="User-supplied progression.",
+    )
+    state.chord_progressions = [progression]
+    add_history(
+        state,
+        "chords_manual",
+        {"chord_count": len(cleaned), "chords": cleaned},
+    )
+    _update_explanation_report(
+        state,
+        source_action="chords_manual",
+        summary="User supplied a chord progression directly; DQN/lyric pathway bypassed.",
+    )
+    _save_session(state)
+    return ChordsManualResponse(session_id=payload.session_id, chord_progression=progression)
+
+
 @app.post("/melody/continue", response_model=MelodyContinueResponse)
 def continue_melody(request: Request, payload: MelodyContinueRequest) -> MelodyContinueResponse:
     bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="melody")
     state = _get_session_or_404(str(payload.session_id))
-    state.melody_suggestions = build_melody_suggestions(state, payload.num_suggestions)
-    add_history(state, "melody_continued", {"count": payload.num_suggestions})
-    _update_explanation_report(
-        state,
-        source_action="melody_continue",
-        summary="Mock continuation generated candidate phrases with simple coherence scores and constraint logs.",
+    run_id = experiment_logger.start_run(
+        "melody_continue",
+        metadata={
+            "session_id": str(state.session_id),
+            "requested_suggestions": payload.num_suggestions,
+            "engine": "music_transformer",
+        },
     )
-    _save_session(state)
-    return MelodyContinueResponse(
-        session_id=state.session_id,
-        melody_suggestions=state.melody_suggestions,
+    try:
+        state.melody_suggestions = run_continuation_pipeline(state, top_n=payload.num_suggestions)
+        engines = sorted({suggestion.engine for suggestion in state.melody_suggestions})
+        state.user_params["continuation_run_id"] = run_id
+        state.user_params["continuation_engines"] = engines
+        experiment_logger.log_artifact(
+            run_id,
+            kind="continuation_trace",
+            filename="continuation_trace.json",
+            payload={
+                "candidate_count": state.user_params.get("continuation_candidate_count"),
+                "survivor_count": state.user_params.get("continuation_survivor_count"),
+                "constraint_trace": state.user_params.get("continuation_constraint_trace", []),
+                "rejection_metadata": state.user_params.get("continuation_rejection_metadata", []),
+                "engines": engines,
+            },
+            base_url=str(request.base_url).rstrip("/"),
+        )
+        experiment_logger.finish_run(run_id)
+        add_history(
+            state,
+            "melody_continued",
+            {"count": len(state.melody_suggestions), "engine": engines[0] if len(engines) == 1 else engines},
+        )
+        _update_explanation_report(
+            state,
+            source_action="melody_continue",
+            summary="Music Transformer continuation generated candidate phrases with constraint traces and profile scores.",
+        )
+        _save_session(state)
+        return MelodyContinueResponse(
+            session_id=state.session_id,
+            melody_suggestions=state.melody_suggestions,
+        )
+    except Exception as exc:  # pragma: no cover - model/runtime failures surface to API clients
+        experiment_logger.finish_run(run_id, error=exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/melody/accept", response_model=SessionStateResponse)
+def accept_melody_continuation(request: Request, payload: MelodyAcceptRequest) -> SessionStateResponse:
+    bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="melody")
+    state = _get_session_or_404(str(payload.session_id))
+    if payload.suggestion_index >= len(state.melody_suggestions):
+        raise HTTPException(status_code=400, detail="suggestion_index is out of range")
+
+    suggestion = state.melody_suggestions[payload.suggestion_index]
+    if not suggestion.notes:
+        raise HTTPException(status_code=400, detail="Selected continuation has no decoded notes")
+
+    run_id = experiment_logger.start_run(
+        "melody_continue_accept",
+        metadata={
+            "session_id": str(state.session_id),
+            "suggestion_index": payload.suggestion_index,
+            "engine": suggestion.engine,
+            "coherence_score": suggestion.coherence_score,
+        },
     )
+    try:
+        appended_notes = _append_continuation_notes(state, suggestion)
+        state.user_params["accepted_continuation_engine"] = suggestion.engine
+        state.user_params["accepted_continuation_index"] = payload.suggestion_index
+        state.user_params["accepted_continuation_run_id"] = run_id
+        state.melody_suggestions = []
+        add_history(
+            state,
+            "melody_continuation_accepted",
+            {
+                "suggestion_index": payload.suggestion_index,
+                "engine": suggestion.engine,
+                "note_count": len(appended_notes),
+                "run_id": run_id,
+            },
+        )
+        _update_explanation_report(
+            state,
+            source_action="melody_continue_accept",
+            summary="Selected Music Transformer continuation was appended to the session melody and the profile was recomputed.",
+        )
+        experiment_logger.finish_run(run_id)
+        _save_session(state)
+        return SessionStateResponse(state=state)
+    except Exception as exc:  # pragma: no cover
+        experiment_logger.finish_run(run_id, error=exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/suggest/lyrics", response_model=SuggestLyricsResponse)

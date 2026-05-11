@@ -11,8 +11,11 @@ import numpy as np
 import soundfile as sf
 from fastapi.testclient import TestClient
 
+import backend.app as backend_app
 from backend.app import app, database, experiment_logger
 from backend.mock_pipeline import count_syllables
+from ml.melody_sketchpad.profile import build_melody_profile
+from shared.schemas import MelodySuggestion, NoteEvent
 
 
 def reset_storage() -> None:
@@ -52,8 +55,9 @@ def build_mp3_bytes(*, sample_rate: int = 22_050, duration_seconds: float = 1.0)
         output.unlink(missing_ok=True)
 
 
-def test_task_1_4_api_flow() -> None:
+def test_task_1_4_api_flow(monkeypatch) -> None:
     reset_storage()
+    monkeypatch.setattr(backend_app, "run_continuation_pipeline", _fake_continuation_pipeline)
     client = TestClient(app)
 
     created = client.post("/session/create", json={"user_params": {"genre": "indie pop"}})
@@ -135,6 +139,37 @@ def test_task_1_4_api_flow() -> None:
     assert len(body["history"]) >= 7
 
 
+def test_accept_melody_continuation_appends_notes_and_logs_engine() -> None:
+    reset_storage()
+    client = TestClient(app)
+    state = backend_app.session_manager.create_session()
+    state.melody_notes = [
+        NoteEvent(pitch=60, onset=0.0, duration=1.0, velocity=96, confidence=1.0),
+        NoteEvent(pitch=62, onset=1.0, duration=1.0, velocity=96, confidence=1.0),
+    ]
+    state.melody_profile = build_melody_profile(state.melody_notes)
+    state.detected_tempo = 120.0
+    state.melody_suggestions = [_fake_suggestion(0)]
+    backend_app.session_manager.update_session(state.session_id, state)
+
+    response = client.post(
+        "/melody/accept",
+        json={"session_id": str(state.session_id), "suggestion_index": 0},
+    )
+
+    assert response.status_code == 200
+    body = response.json()["state"]
+    assert len(body["melody_notes"]) == 4
+    assert body["melody_notes"][2]["pitch"] == 67
+    assert body["melody_notes"][2]["onset"] == 2.0
+    assert body["melody_profile"] is not None
+    assert body["melody_suggestions"] == []
+    assert body["user_params"]["accepted_continuation_engine"] == "music_transformer"
+    run = backend_app.experiment_logger.run_store.get_run(body["user_params"]["accepted_continuation_run_id"])
+    assert run is not None
+    assert run["metadata"]["engine"] == "music_transformer"
+
+
 def test_melody_from_hum_uses_mock_pipeline_for_melancholic_key() -> None:
     reset_storage()
     client = TestClient(app)
@@ -147,6 +182,35 @@ def test_melody_from_hum_uses_mock_pipeline_for_melancholic_key() -> None:
 
     assert response.status_code == 200
     assert response.json()["detected_key"] == "A minor"
+
+
+def _fake_continuation_pipeline(state, *, top_n: int = 3, **_) -> list[MelodySuggestion]:
+    state.user_params["continuation_candidate_count"] = 8
+    state.user_params["continuation_survivor_count"] = top_n
+    state.user_params["continuation_constraint_trace"] = [
+        {"candidate": index + 1, "status": "accepted", "score": 0.9 - (index * 0.1)}
+        for index in range(top_n)
+    ]
+    state.user_params["continuation_rejection_metadata"] = [
+        {"model_id": "single", "temperature": 0.9, "rejection_reason": "fixture", "candidate_idx": top_n}
+    ]
+    return [_fake_suggestion(index) for index in range(top_n)]
+
+
+def _fake_suggestion(index: int) -> MelodySuggestion:
+    return MelodySuggestion(
+        midi_bytes=b"MThd\x00\x00\x00\x06",
+        notes=[
+            NoteEvent(pitch=67 + index, onset=0.0, duration=1.0, velocity=90, confidence=0.95),
+            NoteEvent(pitch=69 + index, onset=1.0, duration=1.0, velocity=90, confidence=0.95),
+        ],
+        explanation=f"Fixture continuation {index + 1}",
+        coherence_score=0.9 - (index * 0.1),
+        engine="music_transformer",
+        avg_log_prob=-0.2,
+        constraint_trace={"status": "accepted"},
+        score_breakdown={"profile_score": 0.9},
+    )
 
 
 def test_count_syllables_counts_syllables_not_words() -> None:
@@ -167,6 +231,52 @@ def test_melody_from_hum_accepts_mp3_upload() -> None:
     body = response.json()
     assert len(body["melody_notes"]) >= 1
     assert body["melody_profile"] is not None
+
+
+def test_chords_manual_endpoint_persists_user_progression() -> None:
+    reset_storage()
+    client = TestClient(app)
+
+    created = client.post("/session/create")
+    assert created.status_code == 200
+    session_id = created.json()["state"]["session_id"]
+
+    response = client.post(
+        "/chords/manual",
+        json={"session_id": session_id, "chords": ["C", "F", "G", "C"]},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"] == session_id
+    progression = body["chord_progression"]
+    assert progression["chords"] == ["C", "F", "G", "C"]
+    assert progression["score"] == 1.0
+    assert "user-supplied" in progression["explanation"].lower()
+
+    # Round-trip: the saved progression replaces any prior chord_progressions
+    # and is the one Phase 5 chord-consonance constraint will read.
+    state = client.get(f"/session/{session_id}/state").json()["state"]
+    assert len(state["chord_progressions"]) == 1
+    assert state["chord_progressions"][0]["chords"] == ["C", "F", "G", "C"]
+
+
+def test_chords_manual_endpoint_rejects_unparseable_symbol() -> None:
+    reset_storage()
+    client = TestClient(app)
+
+    created = client.post("/session/create")
+    session_id = created.json()["state"]["session_id"]
+
+    response = client.post(
+        "/chords/manual",
+        json={"session_id": session_id, "chords": ["C", "WAT", "G"]},
+    )
+    assert response.status_code == 400
+    assert "WAT" in response.json()["detail"]
+
+    # Failure must not partially mutate session state.
+    state = client.get(f"/session/{session_id}/state").json()["state"]
+    assert state["chord_progressions"] == []
 
 
 def test_request_logging_emits_structured_json(caplog) -> None:

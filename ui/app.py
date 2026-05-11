@@ -9,9 +9,9 @@ import requests
 import streamlit as st
 
 try:
-    from ui.audio_utils import decode_midi_bytes, render_audio_from_session
+    from ui.audio_utils import decode_midi_bytes, render_audio_from_session, synthesize_wave_from_notes
 except ModuleNotFoundError:  # pragma: no cover - script execution fallback
-    from audio_utils import decode_midi_bytes, render_audio_from_session
+    from audio_utils import decode_midi_bytes, render_audio_from_session, synthesize_wave_from_notes
 
 
 DEFAULT_API_URL = os.environ.get("HUMMUSE_API_URL", "http://127.0.0.1:8000")
@@ -153,6 +153,34 @@ def generate_chords_from_lyrics(
     )
 
 
+def submit_manual_chords(
+    api_base_url: str,
+    *,
+    session_id: str,
+    chords: list[str],
+) -> dict[str, Any]:
+    return api_post(
+        api_base_url,
+        "/chords/manual",
+        payload={"session_id": session_id, "chords": chords},
+    )
+
+
+def parse_manual_chord_input(raw: str) -> list[str]:
+    """Split free-form chord input on commas, arrows, pipes, and whitespace.
+
+    Accepts inputs like "C, F, G, C", "C -> F -> G -> C", "C | F | G | C",
+    or just "C F G C". Returns the cleaned, non-empty token list. Validation
+    of individual symbols is the API's job (it reuses the constraint
+    pipeline's parser so the rules cannot drift between layers).
+    """
+    if not raw:
+        return []
+    import re
+
+    return [token for token in re.split(r"[\s,|]+|->|—|–", raw) if token]
+
+
 def request_melody_suggestions(
     api_base_url: str,
     *,
@@ -163,6 +191,19 @@ def request_melody_suggestions(
         api_base_url,
         "/melody/continue",
         payload={"session_id": session_id, "num_suggestions": num_suggestions},
+    )
+
+
+def accept_melody_suggestion(
+    api_base_url: str,
+    *,
+    session_id: str,
+    suggestion_index: int,
+) -> dict[str, Any]:
+    return api_post(
+        api_base_url,
+        "/melody/accept",
+        payload={"session_id": session_id, "suggestion_index": suggestion_index},
     )
 
 
@@ -610,6 +651,43 @@ def render_chords_tab() -> None:
         except requests.RequestException as exc:
             st.error(f"Could not generate chords: {exc}")
 
+    st.markdown("---")
+    st.markdown("**Type your own progression**")
+    st.caption(
+        "Bypass lyric/DQN inference and supply a progression directly. "
+        "Separate chords with commas, arrows (->), pipes (|), or whitespace. "
+        "Phase 5 melody continuation will constrain candidates to fit it."
+    )
+    manual_chord_input = st.text_input(
+        "Progression",
+        value=st.session_state.get("manual_chord_input", ""),
+        key="manual_chord_input",
+        placeholder="e.g. C, F, G, C",
+    )
+    parsed_chords = parse_manual_chord_input(manual_chord_input)
+    if manual_chord_input and parsed_chords:
+        st.caption(f"Parsed: {' -> '.join(parsed_chords)}")
+    if st.button(
+        "Use this progression",
+        use_container_width=True,
+        disabled=not parsed_chords,
+        key="manual_chord_submit",
+    ):
+        try:
+            submit_manual_chords(
+                DEFAULT_API_URL,
+                session_id=state["session_id"],
+                chords=parsed_chords,
+            )
+            st.session_state.active_session_state = fetch_session_state(
+                DEFAULT_API_URL,
+                state["session_id"],
+            )
+            state = st.session_state.active_session_state
+            st.success(f"Saved user-supplied progression ({len(parsed_chords)} chords).")
+        except requests.RequestException as exc:
+            st.error(f"Could not save progression: {exc}")
+
     progressions = state.get("chord_progressions", [])
     if progressions:
         for progression in progressions:
@@ -653,7 +731,30 @@ def render_suggestions_tab() -> None:
         if melody_suggestions:
             for index, suggestion in enumerate(melody_suggestions, start=1):
                 st.write(numbered_label(index, suggestion["explanation"]))
-                st.caption(f"Coherence score: {suggestion['coherence_score']:.2f}")
+                engine = suggestion.get("engine", "mock")
+                avg_log_prob = suggestion.get("avg_log_prob")
+                log_prob_text = f" | avg log P: {avg_log_prob:.2f}" if avg_log_prob is not None else ""
+                st.caption(
+                    f"Engine: {engine} | Coherence score: {suggestion['coherence_score']:.2f}{log_prob_text}"
+                )
+                if suggestion.get("notes"):
+                    try:
+                        st.audio(synthesize_wave_from_notes(suggestion["notes"]), format="audio/wav")
+                    except Exception:
+                        st.caption("Preview unavailable for this continuation.")
+                if st.button("Use this continuation", key=f"accept_melody_suggestion_{index}", use_container_width=True):
+                    try:
+                        response = accept_melody_suggestion(
+                            DEFAULT_API_URL,
+                            session_id=state["session_id"],
+                            suggestion_index=index - 1,
+                        )
+                        st.session_state.active_session_state = response["state"]
+                        state = st.session_state.active_session_state
+                        st.success("Melody extended.")
+                        st.rerun()
+                    except requests.RequestException as exc:
+                        st.error(f"Could not apply melody continuation: {exc}")
         else:
             st.caption("No melody continuations yet.")
 

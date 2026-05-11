@@ -46,6 +46,11 @@ class MelodySuggestion(SchemaModel):
     notes: list[NoteEvent] = Field(default_factory=list)
     explanation: str = Field(..., min_length=1)
     coherence_score: float = Field(..., ge=0, le=1)
+    engine: str = "mock"
+    model_id: str | None = None
+    avg_log_prob: float | None = None
+    constraint_trace: dict[str, Any] = Field(default_factory=dict)
+    score_breakdown: dict[str, Any] = Field(default_factory=dict)
 
 
 class LyricSuggestion(SchemaModel):
@@ -330,7 +335,16 @@ class ChordExplanation(SchemaModel):
 
 
 class ChordProgression(SchemaModel):
-    chords: list[str] = Field(default_factory=list)
+    chords: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Chord symbols in playback order. Convention: one chord per bar "
+            "(4 beats in 4/4). The Phase 5 chord-consonance constraint in "
+            "ml/melody_sketchpad/continuation/constraints.py depends on this — "
+            "if you change a producer (DQN, lyric templates, user input, mock) "
+            "to emit variable durations, update the chord-index math there too."
+        ),
+    )
     score: float = Field(..., ge=0, le=1)
     model_confidence: float | None = Field(default=None, ge=0, le=1)
     mood_alignment: float | None = Field(default=None, ge=0, le=1)
@@ -431,4 +445,3 @@ class SessionSummary(SchemaModel):
 
 
 Progression = ChordProgression
-

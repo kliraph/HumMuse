@@ -48,6 +48,23 @@ class LyricsToChordsResponse(BaseModel):
     top_progressions: list[list[str]] = Field(..., min_length=3, max_length=3)
     chord_progressions: list[Progression] = Field(default_factory=list)
     explanation: list[ExplanationPart] = Field(default_factory=list)
+
+
+class ChordsManualRequest(BaseModel):
+    """User-supplied chord progression that bypasses the DQN/lyric pathway.
+
+    `chords` is the already-tokenised list of chord symbols
+    (e.g. ["C", "F", "G", "C"]). The UI handles splitting on commas/arrows/
+    whitespace and submits the cleaned list.
+    """
+
+    session_id: UUID
+    chords: list[str] = Field(..., min_length=1, max_length=64)
+
+
+class ChordsManualResponse(BaseModel):
+    session_id: UUID
+    chord_progression: Progression
     session_id: UUID | None = None
 
 
@@ -59,6 +76,11 @@ class MelodyContinueRequest(BaseModel):
 class MelodyContinueResponse(BaseModel):
     session_id: UUID
     melody_suggestions: list[MelodySuggestion] = Field(default_factory=list)
+
+
+class MelodyAcceptRequest(BaseModel):
+    session_id: UUID
+    suggestion_index: int = Field(..., ge=0)
 
 
 class SuggestLyricsRequest(BaseModel):

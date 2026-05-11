@@ -5,6 +5,7 @@ from __future__ import annotations
 from ui.audio_utils import decode_midi_bytes, render_audio_from_session, synthesize_wave_from_notes
 from ui.app import (
     DEFAULT_API_URL,
+    accept_melody_suggestion,
     artifact_by_kind,
     build_audio_file_tuple,
     confidence_to_color,
@@ -180,6 +181,31 @@ def test_send_chat_message_uses_expected_endpoint(monkeypatch) -> None:
         "api_base_url": "http://127.0.0.1:8000",
         "path": "/session/session-123/chat",
         "payload": {"message": "Why Dm?"},
+    }
+
+
+def test_accept_melody_suggestion_uses_expected_endpoint(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_api_post(api_base_url: str, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+        captured["api_base_url"] = api_base_url
+        captured["path"] = path
+        captured["payload"] = payload
+        return {"state": {"session_id": "session-123"}}
+
+    monkeypatch.setattr("ui.app.api_post", fake_api_post)
+
+    result = accept_melody_suggestion(
+        "http://127.0.0.1:8000",
+        session_id="session-123",
+        suggestion_index=2,
+    )
+
+    assert result == {"state": {"session_id": "session-123"}}
+    assert captured == {
+        "api_base_url": "http://127.0.0.1:8000",
+        "path": "/melody/accept",
+        "payload": {"session_id": "session-123", "suggestion_index": 2},
     }
 
 

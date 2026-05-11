@@ -34,6 +34,7 @@ What this module does NOT do
 from __future__ import annotations
 
 import tempfile
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -284,7 +285,7 @@ class MelodyContinuationModel:
     def _write_empty_midi(out_path: Path) -> None:
         """Write a minimal valid MIDI file containing a single empty track."""
         from symusic import Score, Track
-        empty = Score(tpq=480)
+        empty = Score(480)
         empty.tracks.append(Track(name="empty", program=0, is_drum=False))
         empty.dump_midi(str(out_path))
 
@@ -340,7 +341,7 @@ class EnsembleMember:
     checkpoint_path: Path | str
     tokenizer_path: Path | str
     model_id: str
-    temperatures: Sequence[float]
+    temperatures: tuple[float, ...]
     count: int
 
     def __post_init__(self) -> None:
@@ -388,6 +389,119 @@ class EnsembleMember:
         ]
 
 
+class EnsembleMelodyContinuationModel:
+    """
+    Load and hold one MelodyContinuationModel per ensemble member.
+
+    Members must share the same tokenizer signature. This allows multiple
+    checkpoints from the same training run to ensemble, while cross-tokenizer
+    mixtures fail before any generation work starts.
+    """
+
+    def __init__(
+        self,
+        members: Sequence[EnsembleMember],
+        device: str | torch.device = "cpu",
+        top_k: int = 40,
+    ):
+        if not members:
+            raise ValueError("members must be non-empty")
+
+        self.members = list(members)
+        self.device = torch.device(device)
+        self.top_k = top_k
+        self._validate_unique_model_ids()
+        self.tokenizer_signature = self._validate_tokenizer_compatibility()
+        self.models = {
+            member.model_id: MelodyContinuationModel(
+                checkpoint_path=member.checkpoint_path,
+                tokenizer_path=member.tokenizer_path,
+                device=self.device,
+                top_k=self.top_k,
+            )
+            for member in self.members
+        }
+
+    def generate_candidates(
+        self,
+        prompt_midi_path: Path | str,
+        max_new_tokens: int = 128,
+        out_dir: Path | str | None = None,
+    ) -> list[dict]:
+        """
+        Generate candidates from each ensemble member and concatenate results.
+
+        Total candidate count is `sum(member.count for member in members)`.
+        Each member owns its candidate split and temperature schedule.
+        """
+        if out_dir is None:
+            out_dir = Path(tempfile.mkdtemp(prefix="melody_ensemble_cands_"))
+        else:
+            out_dir = Path(out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+        by_member: list[list[dict]] = []
+        for member in self.members:
+            model = self.models[member.model_id]
+            member_results = model.generate_candidates(
+                prompt_midi_path,
+                n_candidates=member.count,
+                max_new_tokens=max_new_tokens,
+                temperatures=member.temperatures,
+                out_dir=out_dir,
+                model_id=member.model_id,
+            )
+            for candidate in member_results:
+                candidate["model_id"] = member.model_id
+            by_member.append(member_results)
+        return self._round_robin(by_member)
+
+    @staticmethod
+    def _round_robin(by_member: list[list[dict]]) -> list[dict]:
+        """Interleave member candidate lists and append longer-member leftovers."""
+        interleaved: list[dict] = []
+        max_len = max((len(member_results) for member_results in by_member), default=0)
+        for idx in range(max_len):
+            for member_results in by_member:
+                if idx < len(member_results):
+                    interleaved.append(member_results[idx])
+        return interleaved
+
+    def _validate_unique_model_ids(self) -> None:
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for member in self.members:
+            if member.model_id in seen:
+                duplicates.append(member.model_id)
+            seen.add(member.model_id)
+        if duplicates:
+            raise ValueError(f"duplicate ensemble model_id values: {sorted(set(duplicates))}")
+
+    def _validate_tokenizer_compatibility(self) -> tuple[int, int, int, int]:
+        baseline_member = self.members[0]
+        baseline = self._tokenizer_signature(baseline_member)
+        for member in self.members[1:]:
+            signature = self._tokenizer_signature(member)
+            if signature != baseline:
+                raise ValueError(
+                    "Ensemble tokenizer mismatch for "
+                    f"model_id={member.model_id!r}: expected "
+                    f"(vocab_size, pad_id, bos_id, eos_id)={baseline} from "
+                    f"model_id={baseline_member.model_id!r}, got {signature}"
+                )
+        return baseline
+
+    @staticmethod
+    def _tokenizer_signature(member: EnsembleMember) -> tuple[int, int, int, int]:
+        tokenizer = load_tokenizer(member.tokenizer_path)
+        return (
+            int(tokenizer.vocab_size),
+            int(tokenizer["PAD_None"]),
+            int(tokenizer["BOS_None"]),
+            int(tokenizer["EOS_None"]),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Smoke test — exercises the pipeline end-to-end against the dry-pass
 # tokenizer + a freshly-instantiated (random-weight) model. Useful for
@@ -410,6 +524,39 @@ def _run_contract_smoke() -> None:
         ) -> torch.Tensor:
             generated = torch.tensor([[7, 8]], dtype=torch.long, device=prompt_tensor.device)
             return torch.cat([prompt_tensor, generated[:, :max_new_tokens]], dim=1)
+
+    class _FakeMemberModel:
+        def __init__(self, source_model_id: str):
+            self.source_model_id = source_model_id
+
+        def generate_candidates(
+            self,
+            prompt_midi_path: Path | str,
+            n_candidates: int,
+            max_new_tokens: int,
+            temperatures: Sequence[float],
+            out_dir: Path | str,
+            model_id: str = "single",
+        ) -> list[dict]:
+            out_dir = Path(out_dir)
+            results: list[dict] = []
+            cand_idx = 0
+            for temp, count in zip(
+                temperatures,
+                MelodyContinuationModel._allocate(n_candidates, len(temperatures)),
+            ):
+                for _ in range(count):
+                    midi_path = out_dir / f"{model_id}_{cand_idx:02d}_t{temp:.2f}.mid"
+                    midi_path.touch()
+                    results.append({
+                        "midi_path": str(midi_path.resolve()),
+                        "tokens": [cand_idx],
+                        "temperature": float(temp),
+                        "log_prob": -0.1,
+                        "model_id": "single",
+                    })
+                    cand_idx += 1
+            return results
 
     with tempfile.TemporaryDirectory(prefix="melody_contract_") as tmp:
         runner = object.__new__(MelodyContinuationModel)
@@ -448,59 +595,144 @@ def _run_contract_smoke() -> None:
         )
         assert members[0].temperature_plan() == [(0.5, 1), (0.7, 1), (0.9, 1)]
         assert members[1].temperature_plan() == [(0.6, 1), (0.8, 1), (1.0, 0)]
+
+        ensemble_members = [
+            EnsembleMember("a.pt", "tokenizer.json", "A", (0.5, 0.7, 0.9), 3),
+            EnsembleMember("b.pt", "tokenizer.json", "B", (0.5, 0.7, 0.9), 3),
+            EnsembleMember("c.pt", "tokenizer.json", "C", (0.7, 0.9), 2),
+        ]
+        ensemble = object.__new__(EnsembleMelodyContinuationModel)
+        ensemble.members = ensemble_members
+        ensemble.models = {
+            member.model_id: _FakeMemberModel(member.model_id)
+            for member in ensemble_members
+        }
+        ensemble_cands = ensemble.generate_candidates(
+            "prompt.mid",
+            max_new_tokens=2,
+            out_dir=tmp,
+        )
+        counts = Counter(c["model_id"] for c in ensemble_cands)
+        temps_by_model = {
+            model_id: [c["temperature"] for c in ensemble_cands if c["model_id"] == model_id]
+            for model_id in counts
+        }
+        assert len(ensemble_cands) == 8, f"expected 8 ensemble candidates, got {len(ensemble_cands)}"
+        assert counts == {"A": 3, "B": 3, "C": 2}
+        assert [c["model_id"] for c in ensemble_cands] == ["A", "B", "C", "A", "B", "C", "A", "B"]
+        assert temps_by_model["A"] == [0.5, 0.7, 0.9]
+        assert temps_by_model["B"] == [0.5, 0.7, 0.9]
+        assert temps_by_model["C"] == [0.7, 0.9]
         print("Contract smoke OK.")
 
 
-if __name__ == "__main__":
-    import sys
+def _write_smoke_prompt_midi(out_path: Path) -> None:
+    """Write a tiny monophonic prompt for tokenizer/inference smoke tests."""
+    from symusic import Note, Score, Track
 
-    here = Path(__file__).parent
-    tok_path = here / "data" / "tokenizer_dry.json"
-    midi_dir = here / "data" / "filtered_test"
-    if not tok_path.exists() or not midi_dir.exists():
-        _run_contract_smoke()
-        sys.exit(0)
+    score = Score(480)
+    track = Track(name="prompt", program=0, is_drum=False)
+    for idx, pitch in enumerate((60, 62, 64, 67)):
+        track.notes.append(Note(idx * 480, 360, pitch, 80))
+    score.tracks.append(track)
+    score.dump_midi(str(out_path))
 
-    sample_mid = next(iter(sorted(midi_dir.glob("*.mid"))), None)
-    if sample_mid is None:
-        print("No .mid files in dry-pass dir.")
-        sys.exit(0)
 
-    # Build a fake "best.pt" from a freshly-instantiated random model so we
-    # can exercise the full pipeline without a trained checkpoint.
-    tk = load_tokenizer(tok_path)
-    fake_config = MusicTransformerConfig(vocab_size=tk.vocab_size, pad_token_id=0)
-    fake_model = MusicTransformer(fake_config)
-    fake_ckpt = here / "data" / "fake_inference.pt"
-    torch.save({
-        "epoch": 0, "val_loss": 99.9,
-        "model": fake_model.state_dict(),
-        "config": fake_config.__dict__,
-        "vocab_size": tk.vocab_size,
-        "pad_id": 0,
-    }, fake_ckpt)
-
-    # Now drive the actual inference class
-    runner = MelodyContinuationModel(fake_ckpt, tok_path, device="cpu", top_k=40)
-    cands = runner.generate_candidates(
-        sample_mid,
-        n_candidates=8,
-        max_new_tokens=64,
-        temperatures=(0.8, 0.9, 1.0),
+def _save_fake_inference_checkpoint(
+    checkpoint_path: Path,
+    tokenizer,
+    seed: int,
+) -> None:
+    """Save a tiny seeded checkpoint with the same contract as training."""
+    torch.manual_seed(seed)
+    config = MusicTransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        d_ff=128,
+        max_seq_len=64,
+        dropout=0.0,
+        pad_token_id=tokenizer["PAD_None"],
     )
+    model = MusicTransformer(config)
+    torch.save({
+        "epoch": 0,
+        "val_loss": 99.9,
+        "model": model.state_dict(),
+        "config": config.__dict__,
+        "vocab_size": tokenizer.vocab_size,
+        "pad_id": tokenizer["PAD_None"],
+    }, checkpoint_path)
 
-    print(f"\nGenerated {len(cands)} candidates from {sample_mid.name}")
-    for i, c in enumerate(cands):
-        print(f"  [{i}] model_id={c['model_id']}  "
-              f"T={c['temperature']:.2f}  "
-              f"len={len(c['tokens']):3d}  "
-              f"avg_logp={c['log_prob']:+.3f}  "
-              f"-> {Path(c['midi_path']).name}")
 
-    # Distribution check
-    temps_seen = [c["temperature"] for c in cands]
-    print(f"\nTemperature distribution: {dict((t, temps_seen.count(t)) for t in set(temps_seen))}")
-    assert len(cands) == 8, f"expected 8 candidates, got {len(cands)}"
-    assert all(c["model_id"] == "single" for c in cands)
-    assert all(Path(c["midi_path"]).name.startswith("single_") for c in cands)
-    print("Smoke test OK.")
+def _resolve_smoke_tokenizer_path(tmp_dir: Path) -> Path:
+    repo_root = Path(__file__).resolve().parents[3]
+    lakh_tokenizer = repo_root / "storage" / "models" / "Lakh-MT" / "tokenizer.json"
+    if lakh_tokenizer.exists():
+        return lakh_tokenizer
+
+    fallback_path = tmp_dir / "tokenizer_smoke.json"
+    try:
+        from .tokenizer_setup import build_tokenizer
+    except ImportError:  # pragma: no cover - supports direct script execution
+        from tokenizer_setup import build_tokenizer
+    build_tokenizer().save(fallback_path)
+    return fallback_path
+
+
+def _run_ensemble_smoke() -> None:
+    with tempfile.TemporaryDirectory(prefix="melody_ensemble_smoke_") as tmp:
+        tmp_dir = Path(tmp)
+        tokenizer_path = _resolve_smoke_tokenizer_path(tmp_dir)
+        tokenizer = load_tokenizer(tokenizer_path)
+
+        prompt_path = tmp_dir / "prompt.mid"
+        _write_smoke_prompt_midi(prompt_path)
+
+        specs = [
+            ("A", 101, (0.5, 0.7, 0.9), 3),
+            ("B", 202, (0.5, 0.7, 0.9), 3),
+            ("C", 303, (0.7, 0.9), 2),
+        ]
+        seeds: list[tuple[Path, str, Sequence[float], int]] = []
+        for model_id, seed, temperatures, count in specs:
+            checkpoint_path = tmp_dir / f"fake_{model_id}_inference.pt"
+            _save_fake_inference_checkpoint(checkpoint_path, tokenizer, seed)
+            seeds.append((checkpoint_path, model_id, temperatures, count))
+
+        members = EnsembleMember.from_seeds(tokenizer_path, seeds)
+        ensemble = EnsembleMelodyContinuationModel(members, device="cpu", top_k=1)
+        out_dir = tmp_dir / "candidates"
+        cands = ensemble.generate_candidates(
+            prompt_path,
+            max_new_tokens=4,
+            out_dir=out_dir,
+        )
+
+        counts = Counter(c["model_id"] for c in cands)
+        temps_by_model = {
+            model_id: [c["temperature"] for c in cands if c["model_id"] == model_id]
+            for model_id, _, _, _ in specs
+        }
+        midi_paths = [Path(c["midi_path"]) for c in cands]
+        filenames = [p.name for p in midi_paths]
+
+        print("\nEnsemble smoke breakdown:")
+        for model_id, _, _, _ in specs:
+            print(f"  {model_id}: count={counts[model_id]} temps={temps_by_model[model_id]}")
+        print(f"  order={[c['model_id'] for c in cands]}")
+        print(f"  files={filenames}")
+
+        assert len(cands) == 8, f"expected 8 candidates, got {len(cands)}"
+        assert counts == {"A": 3, "B": 3, "C": 2}, counts
+        assert temps_by_model["A"] == [0.5, 0.7, 0.9]
+        assert temps_by_model["B"] == [0.5, 0.7, 0.9]
+        assert temps_by_model["C"] == [0.7, 0.9]
+        assert all(p.exists() for p in midi_paths), filenames
+        assert len(filenames) == len(set(filenames)), filenames
+        print("Ensemble smoke test OK.")
+
+
+if __name__ == "__main__":
+    _run_ensemble_smoke()
