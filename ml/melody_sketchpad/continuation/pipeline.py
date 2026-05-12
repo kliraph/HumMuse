@@ -129,6 +129,8 @@ def continue_melody(
             detected_key=session_state.detected_key,
             chord_progressions=session_state.chord_progressions,
             max_survivors=max(top_n, 5),
+            primer_section=session_state.primer_section,
+            target_section=session_state.target_section,
         )
         scored = score_candidates(filtered.survivors, primer_profile)
         suggestions = [

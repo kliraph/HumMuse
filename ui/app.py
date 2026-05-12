@@ -186,11 +186,23 @@ def request_melody_suggestions(
     *,
     session_id: str,
     num_suggestions: int = 3,
+    primer_section: str | None = None,
+    target_section: str | None = None,
 ) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "num_suggestions": num_suggestions,
+    }
+    # Only include section labels when actually set; the backend treats
+    # missing fields as "fall back to primer-relative constraints".
+    if primer_section is not None:
+        payload["primer_section"] = primer_section
+    if target_section is not None:
+        payload["target_section"] = target_section
     return api_post(
         api_base_url,
         "/melody/continue",
-        payload={"session_id": session_id, "num_suggestions": num_suggestions},
+        payload=payload,
     )
 
 
@@ -712,11 +724,45 @@ def render_suggestions_tab() -> None:
 
     with melody_column:
         st.markdown("**Melody continuation**")
+        # Song-form section labels. Both default to "Any" (=> no label sent
+        # => backend uses primer-relative constraints). When the user picks
+        # both (e.g. verse -> chorus), the constraint stage switches to
+        # BiMMuDa-derived section-conditional checks.
+        section_options = ["Any", "verse", "pre_chorus", "chorus", "bridge"]
+        section_cols = st.columns(2)
+        with section_cols[0]:
+            primer_section_choice = st.selectbox(
+                "I hummed a…",
+                section_options,
+                index=0,
+                key=f"primer_section_{state['session_id']}",
+                help=(
+                    "Optional song-form label for the primer you hummed. "
+                    "Leave as 'Any' to continue stylistically; pick a section "
+                    "together with a target to apply BiMMuDa transition priors."
+                ),
+            )
+        with section_cols[1]:
+            target_section_choice = st.selectbox(
+                "Generate a…",
+                section_options,
+                index=0,
+                key=f"target_section_{state['session_id']}",
+                help=(
+                    "Optional song-form target for the continuation. Together "
+                    "with the primer label, switches on section-conditional "
+                    "constraints (e.g. verse → chorus lifts register)."
+                ),
+            )
+        primer_section = None if primer_section_choice == "Any" else primer_section_choice
+        target_section = None if target_section_choice == "Any" else target_section_choice
         if st.button("Generate Melody Continuations", use_container_width=True):
             try:
                 response = request_melody_suggestions(
                     DEFAULT_API_URL,
                     session_id=state["session_id"],
+                    primer_section=primer_section,
+                    target_section=target_section,
                 )
                 st.session_state.active_session_state = fetch_session_state(
                     DEFAULT_API_URL,

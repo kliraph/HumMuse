@@ -11,6 +11,7 @@ from typing import Any, Iterable
 from symusic import Score
 
 from ml.harmony.chord_symbols import NAME_TO_PC, QUALITY_TEMPLATES, parse_key
+from ml.melody_sketchpad.continuation.priors import load_transition_profile
 from ml.melody_sketchpad.profile import build_melody_profile
 from shared.schemas import ChordProgression, MelodyProfile, NoteEvent
 
@@ -20,6 +21,10 @@ _PITCH_RANGE_SEMITONES = 4
 _DENSITY_TOLERANCE = 0.20
 _STRONG_BEAT_TOLERANCE = 0.08
 _BEATS_PER_BAR = 4.0
+# z-score cap for conditional-prior checks. Wide on purpose: BiMMuDa stds
+# are large relative to the means, so a tight z (e.g. 1.5) would reject
+# most stylistically reasonable continuations.
+_CONDITIONAL_Z_MAX = 2.0
 
 
 @dataclass(frozen=True)
@@ -39,9 +44,18 @@ def filter_candidates(
     detected_key: str | None,
     chord_progressions: list[ChordProgression] | None = None,
     max_survivors: int = _DEFAULT_MAX_SURVIVORS,
+    primer_section: str | None = None,
+    target_section: str | None = None,
 ) -> ConstraintFilterResult:
     """
     Decode and filter continuation candidates using session-level constraints.
+
+    When `primer_section` and `target_section` are both set AND the
+    BiMMuDa-derived transition prior for that pair meets the minimum sample
+    threshold, the density / pitch-range primer-relative checks are replaced
+    by conditional-on-transition checks, and two new section-aware checks
+    fire (register shift, boundary interval). Otherwise the function uses
+    purely primer-relative checks (continue stylistically near the primer).
 
     Rejected candidates are retained in `trace` with reason strings and in
     `rejection_metadata` as compact run-log records. Accepted candidates are
@@ -53,6 +67,7 @@ def filter_candidates(
 
     primer_last_pitch = _last_pitch(primer_notes)
     chord_symbols = _first_progression_symbols(chord_progressions or [])
+    transition = load_transition_profile(primer_section, target_section)
 
     accepted: list[dict[str, Any]] = []
     trace: list[dict[str, Any]] = []
@@ -67,10 +82,12 @@ def filter_candidates(
             checks = _evaluate_candidate(
                 notes=notes,
                 candidate_profile=candidate_profile,
+                primer_notes=primer_notes,
                 primer_profile=primer_profile,
                 primer_last_pitch=primer_last_pitch,
                 detected_key=detected_key,
                 chord_symbols=chord_symbols,
+                transition=transition,
             )
             reasons = [check["reason"] for check in checks if not check["passed"]]
             status = "accepted" if not reasons else "rejected"
@@ -161,20 +178,144 @@ def _evaluate_candidate(
     *,
     notes: list[NoteEvent],
     candidate_profile: MelodyProfile,
+    primer_notes: list[NoteEvent],
     primer_profile: MelodyProfile,
     primer_last_pitch: int | None,
     detected_key: str | None,
     chord_symbols: list[str],
+    transition: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     if not notes:
         return [_check("nonempty_midi", False, 0.0, "candidate MIDI contains no melody notes")]
 
+    if transition is None:
+        # Primer-relative branch: continue stylistically near the primer.
+        return [
+            _key_adherence_check(notes, detected_key),
+            _pitch_range_check(notes, primer_last_pitch),
+            _density_check(candidate_profile, primer_profile),
+            _chord_consonance_check(notes, chord_symbols),
+        ]
+
+    # Section-conditional branch: apply BiMMuDa deltas on top of the primer.
     return [
         _key_adherence_check(notes, detected_key),
-        _pitch_range_check(notes, primer_last_pitch),
-        _density_check(candidate_profile, primer_profile),
         _chord_consonance_check(notes, chord_symbols),
+        _conditional_density_check(candidate_profile, primer_profile, transition),
+        _conditional_pitch_span_check(notes, primer_notes, transition),
+        _register_shift_check(notes, primer_notes, transition),
+        _boundary_interval_check(notes, primer_notes, transition),
     ]
+
+
+def _conditional_density_check(
+    candidate_profile: MelodyProfile,
+    primer_profile: MelodyProfile,
+    transition: dict[str, Any],
+) -> dict[str, Any]:
+    """Density should equal primer_density + BiMMuDa delta, within 2σ."""
+    delta = transition["delta_density_notes_per_bar"]
+    expected = float(primer_profile.rhythmic_density) + float(delta["mean"])
+    std = max(float(delta["std"]), 1e-6)
+    observed = float(candidate_profile.rhythmic_density)
+    z = abs(observed - expected) / std
+    score = max(0.0, 1.0 - z / _CONDITIONAL_Z_MAX)
+    return _check(
+        "conditional_density",
+        z <= _CONDITIONAL_Z_MAX,
+        score,
+        (
+            f"conditional density {observed:.2f} differs from expected {expected:.2f} "
+            f"(primer {primer_profile.rhythmic_density:.2f} + Δ {delta['mean']:+.2f}) "
+            f"by {z:.2f}σ"
+        ),
+    )
+
+
+def _conditional_pitch_span_check(
+    notes: list[NoteEvent],
+    primer_notes: list[NoteEvent],
+    transition: dict[str, Any],
+) -> dict[str, Any]:
+    """Candidate span (max-min pitch) should equal primer_span + delta, within 2σ."""
+    if not primer_notes:
+        return _check("conditional_pitch_span", True, 1.0, "")
+    primer_span = _pitch_span(primer_notes)
+    candidate_span = _pitch_span(notes)
+    delta = transition["delta_pitch_range_semitones"]
+    expected = primer_span + float(delta["mean"])
+    std = max(float(delta["std"]), 1e-6)
+    z = abs(candidate_span - expected) / std
+    score = max(0.0, 1.0 - z / _CONDITIONAL_Z_MAX)
+    return _check(
+        "conditional_pitch_span",
+        z <= _CONDITIONAL_Z_MAX,
+        score,
+        (
+            f"conditional span {candidate_span} st differs from expected {expected:.1f} st "
+            f"(primer span {primer_span} + Δ {delta['mean']:+.2f}) by {z:.2f}σ"
+        ),
+    )
+
+
+def _register_shift_check(
+    notes: list[NoteEvent],
+    primer_notes: list[NoteEvent],
+    transition: dict[str, Any],
+) -> dict[str, Any]:
+    """Candidate mean pitch should equal primer mean pitch + delta_register, within 2σ."""
+    if not primer_notes:
+        return _check("register_shift", True, 1.0, "")
+    primer_register = sum(int(note.pitch) for note in primer_notes) / len(primer_notes)
+    candidate_register = sum(int(note.pitch) for note in notes) / len(notes)
+    delta = transition["delta_register_semitones"]
+    expected = primer_register + float(delta["mean"])
+    std = max(float(delta["std"]), 1e-6)
+    z = abs(candidate_register - expected) / std
+    score = max(0.0, 1.0 - z / _CONDITIONAL_Z_MAX)
+    return _check(
+        "register_shift",
+        z <= _CONDITIONAL_Z_MAX,
+        score,
+        (
+            f"register {candidate_register:.1f} differs from expected {expected:.1f} "
+            f"(primer {primer_register:.1f} + Δ {delta['mean']:+.2f}) by {z:.2f}σ"
+        ),
+    )
+
+
+def _boundary_interval_check(
+    notes: list[NoteEvent],
+    primer_notes: list[NoteEvent],
+    transition: dict[str, Any],
+) -> dict[str, Any]:
+    """|candidate_first - primer_last| should match BiMMuDa boundary magnitude, within 2σ."""
+    if not primer_notes or not notes:
+        return _check("boundary_interval", True, 1.0, "")
+    primer_last = max(primer_notes, key=lambda note: note.onset + note.duration).pitch
+    candidate_first = min(notes, key=lambda note: note.onset).pitch
+    observed = abs(int(candidate_first) - int(primer_last))
+    profile = transition["boundary_interval_semitones"]
+    expected = float(profile["mean"])
+    std = max(float(profile["std"]), 1e-6)
+    z = abs(observed - expected) / std
+    score = max(0.0, 1.0 - z / _CONDITIONAL_Z_MAX)
+    return _check(
+        "boundary_interval",
+        z <= _CONDITIONAL_Z_MAX,
+        score,
+        (
+            f"boundary interval |{candidate_first} - {primer_last}| = {observed} st "
+            f"differs from expected {expected:.1f} st by {z:.2f}σ"
+        ),
+    )
+
+
+def _pitch_span(notes: list[NoteEvent]) -> int:
+    if not notes:
+        return 0
+    pitches = [int(note.pitch) for note in notes]
+    return max(pitches) - min(pitches)
 
 
 def _key_adherence_check(notes: list[NoteEvent], detected_key: str | None) -> dict[str, Any]:

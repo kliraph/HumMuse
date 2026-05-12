@@ -17,6 +17,7 @@ from shared.schemas import (
     MelodySuggestion,
     NoteEvent,
     Progression,
+    Section,
     SessionState,
 )
 
@@ -71,6 +72,13 @@ class ChordsManualResponse(BaseModel):
 class MelodyContinueRequest(BaseModel):
     session_id: UUID
     num_suggestions: int = Field(default=3, ge=1, le=5)
+    # Optional song-form labels. When both are set and the BiMMuDa transition
+    # prior for (primer_section -> target_section) is statistically reliable,
+    # the continuation pipeline switches to section-conditional constraints.
+    # When either is None, the pipeline degrades to primer-relative checks
+    # (continue stylistically near the primer).
+    primer_section: Section | None = None
+    target_section: Section | None = None
 
 
 class MelodyContinueResponse(BaseModel):

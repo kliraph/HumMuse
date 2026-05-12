@@ -113,6 +113,7 @@ def fake_response(content: str = "hello", *, model: str = "provider-model") -> o
 def clean_llm_env(monkeypatch):
     for key in ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(client_module, "load_dotenv", lambda *_, **__: None)
 
 
 def test_yandex_defaults_use_model_base_url_and_generic_key(monkeypatch) -> None:

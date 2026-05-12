@@ -16,6 +16,7 @@ from shared.schemas import (
     MelodySuggestion,
     NoteEvent,
     Progression,
+    RefinementOp,
     RefinementPlan,
     SessionState,
 )
@@ -122,31 +123,90 @@ def build_lyric_suggestions(state: SessionState, mode: str, count: int = 3) -> l
 
 def build_refinement_plan(instruction: str, target: str | None = None) -> RefinementPlan:
     lowered = instruction.lower()
-    target_pipeline = "session"
-    adjustments: dict[str, object] = {"requested_target": target or "session"}
+    operations: list[RefinementOp] = []
+    less_sad = any(phrase in lowered for phrase in ("less sad", "менее груст", "не так груст", "менее печал", "светлее", "повеселее"))
 
-    if target == "chords" or any(word in lowered for word in ("jazz", "chord", "harmon")):
-        target_pipeline = "harmonizer"
-        adjustments["chord_complexity"] = "high" if "jazz" in lowered else "medium"
-        adjustments["emotion_valence"] = -0.2 if any(word in lowered for word in ("dark", "sad", "myster")) else 0.1
-    elif target == "melody" or any(word in lowered for word in ("melody", "hook", "contour")):
-        target_pipeline = "melody_generator"
-        adjustments["contour"] = "rising" if "lift" in lowered or "up" in lowered else "varied"
-        adjustments["rhythmic_density"] = "lighter" if "space" in lowered else "steady"
-    elif target == "suggestions":
-        target_pipeline = "both"
-        adjustments["variation"] = "higher"
-    elif target == "lyrics":
-        target_pipeline = "lyric_generator"
-        adjustments["imagery"] = "more vivid"
+    if target == "chords" or any(
+        word in lowered
+        for word in (
+            "jazz",
+            "chord",
+            "harmon",
+            "sad",
+            "dark",
+            "myster",
+            "джаз",
+            "аккорд",
+            "гармон",
+            "груст",
+            "печал",
+            "темн",
+            "тёмн",
+            "мрач",
+        )
+    ):
+        operations.append(
+            RefinementOp(
+                target="harmonizer",
+                params={
+                    "requested_target": target or "session",
+                    "chord_complexity": "high" if "jazz" in lowered or "джаз" in lowered else "medium",
+                    "emotion_valence": 0.2
+                    if less_sad
+                    else -0.2
+                    if any(word in lowered for word in ("dark", "sad", "myster", "груст", "печал", "темн", "тёмн", "мрач"))
+                    else 0.1,
+                },
+                rationale="Adjust harmonic color and chord-selection settings.",
+            )
+        )
+    if target == "melody" or any(
+        word in lowered
+        for word in ("melody", "hook", "contour", "shorter", "short", "мелод", "хук", "короч", "припев", "куплет")
+    ):
+        operations.append(
+            RefinementOp(
+                target="melody_generator",
+                params={
+                    "requested_target": target or "session",
+                    "contour": "rising" if "lift" in lowered or "up" in lowered else "varied",
+                    "rhythmic_density": "lighter" if "space" in lowered else "steady",
+                    "length": "shorter" if "short" in lowered or "короч" in lowered else "unchanged",
+                },
+                rationale="Adjust melodic shape or phrase length.",
+            )
+        )
+    if target in ("suggestions", "lyrics") or any(
+        word in lowered
+        for word in ("lyric", "lyrics", "line", "option", "options", "write", "текст", "лирик", "строк", "вариант", "напиши", "напиш")
+    ):
+        option_count = 2 if "2" in lowered or "two" in lowered or "два" in lowered else 3
+        operations.append(
+            RefinementOp(
+                target="lyric_generator",
+                params={
+                    "requested_target": target or "session",
+                    "imagery": "more vivid",
+                    "num_options": option_count,
+                },
+                rationale="Generate revised lyric options after the musical changes.",
+            )
+        )
+    if not operations:
+        operations.append(
+            RefinementOp(
+                target="session",
+                params={"requested_target": target or "session"},
+                rationale="Keep the request attached to the full session context.",
+            )
+        )
 
     interpretation = (
-        f"Interpreted '{instruction}' as a request to adjust the {target_pipeline.replace('_', ' ')} settings "
+        f"Interpreted '{instruction}' as {len(operations)} ordered refinement operation(s) "
         f"while keeping the current session context."
     )
     return RefinementPlan(
-        target_pipeline=target_pipeline,
-        parameter_adjustments=adjustments,
+        operations=operations,
         interpretation=interpretation,
     )
 
@@ -166,15 +226,18 @@ def build_explanation_report(
         }
         for note in state.melody_notes
     ]
-    constraint_logs = [
-        {
-            "candidate": index + 1,
-            "status": "accepted",
-            "reason": suggestion.explanation,
-            "score": suggestion.coherence_score,
-        }
-        for index, suggestion in enumerate(state.melody_suggestions)
-    ]
+    constraint_logs = list(state.user_params.get("continuation_constraint_trace") or [])
+    if not constraint_logs:
+        constraint_logs = [
+            {
+                "candidate": index + 1,
+                "status": "accepted",
+                "reason": suggestion.explanation,
+                "score": suggestion.coherence_score,
+                "engine": suggestion.engine,
+            }
+            for index, suggestion in enumerate(state.melody_suggestions)
+        ]
     chord_theory = [
         {
             "progression": progression.chords,

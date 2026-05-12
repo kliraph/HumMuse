@@ -8,6 +8,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ml.gpt.abc_serializer import session_state_to_abc
+from ml.gpt.tier1_formatter import format_tier1_summary
 from shared.schemas import ChatMessage, ChordProgression, SessionState
 
 GPTUseCase = Literal["lyric", "refine", "explain"]
@@ -92,6 +94,8 @@ class SessionContextBuilder:
         return SessionContext(
             use_case="explain",
             fields={
+                "session_abc": session_state_to_abc(session_state),
+                "tier1_natural_language": format_tier1_summary(session_state.explanation_report),
                 "explanation_report_tier_1": _model_to_dict(session_state.explanation_report),
                 "chat_history": _chat_messages_to_dicts(session_state.chat_history),
                 "last_user_question": last_user_question or _infer_last_user_question(session_state.chat_history),

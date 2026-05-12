@@ -98,9 +98,22 @@ def test_task_1_4_api_flow(monkeypatch) -> None:
     assert chords.status_code == 200
     assert len(chords.json()["chord_progressions"]) == 3
 
-    continuation = client.post("/melody/continue", json={"session_id": session_id, "num_suggestions": 3})
+    continuation = client.post(
+        "/melody/continue",
+        json={
+            "session_id": session_id,
+            "num_suggestions": 3,
+            "primer_section": "verse",
+            "target_section": "chorus",
+        },
+    )
     assert continuation.status_code == 200
     assert len(continuation.json()["melody_suggestions"]) == 3
+    # Section labels should round-trip onto the persisted SessionState so
+    # later /melody/accept and explanation lookups can see what shaping was applied.
+    state_after_continue = client.get(f"/session/{session_id}/state").json()["state"]
+    assert state_after_continue["primer_section"] == "verse"
+    assert state_after_continue["target_section"] == "chorus"
 
     lyrics = client.post("/suggest/lyrics", json={"session_id": session_id, "mode": "continue"})
     assert lyrics.status_code == 200

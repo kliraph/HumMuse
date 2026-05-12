@@ -13,6 +13,7 @@ from shared.schemas import (
     EmotionVector,
     ExplanationReport,
     MelodyProfile,
+    RefinementOp,
     RefinementPlan,
     SessionState,
 )
@@ -20,8 +21,13 @@ from shared.schemas import (
 
 def _session_state() -> SessionState:
     refinement_plan = RefinementPlan(
-        target_pipeline="harmonizer",
-        parameter_adjustments={"complexity": "high"},
+        operations=[
+            RefinementOp(
+                target="harmonizer",
+                params={"chord_complexity": "high"},
+                rationale="Make the harmony richer.",
+            )
+        ],
         interpretation="Make the harmony richer.",
     )
     return SessionState(
@@ -138,13 +144,15 @@ def test_refine_context_contains_lyric_fields_recent_chat_and_refinement_results
         "Why C here?",
     ]
     assert context["last_refinement_plan_results"]["instruction"] == "make it jazzier"
-    assert context["last_refinement_plan_results"]["plan"]["target_pipeline"] == "harmonizer"
+    assert context["last_refinement_plan_results"]["plan"]["operations"][0]["target"] == "harmonizer"
 
 
 def test_explain_context_contains_tier_1_report_chat_history_and_last_question() -> None:
     context = build_session_context("explain", _session_state())
 
     assert set(context.fields) == {
+        "session_abc",
+        "tier1_natural_language",
         "explanation_report_tier_1",
         "chat_history",
         "last_user_question",
@@ -158,3 +166,17 @@ def test_explain_context_accepts_explicit_last_user_question() -> None:
     context = build_session_context("explain", _session_state(), last_user_question="Why the vi chord?")
 
     assert context["last_user_question"] == "Why the vi chord?"
+
+
+def test_explain_context_includes_session_abc_and_tier1_natural_language() -> None:
+    context = build_session_context("explain", _session_state())
+
+    abc = context["session_abc"]
+    assert isinstance(abc, str)
+    assert abc.startswith("X:1\n")
+    assert "K:Cmaj" in abc or "K:" in abc
+
+    summary = context["tier1_natural_language"]
+    assert isinstance(summary, str)
+    assert "SOURCE: chords_from_lyrics" in summary
+    assert "Tier 1 explanation summary." in summary

@@ -434,12 +434,20 @@ def chords_manual_endpoint(request: Request, payload: ChordsManualRequest) -> Ch
 def continue_melody(request: Request, payload: MelodyContinueRequest) -> MelodyContinueResponse:
     bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="melody")
     state = _get_session_or_404(str(payload.session_id))
+    # Thread per-request section labels onto the loaded session before the
+    # pipeline runs. Persisted on the session so subsequent /melody/accept and
+    # explanation lookups can see what shaping was applied. None values are
+    # honoured — they degrade the constraint stage to primer-relative checks.
+    state.primer_section = payload.primer_section
+    state.target_section = payload.target_section
     run_id = experiment_logger.start_run(
         "melody_continue",
         metadata={
             "session_id": str(state.session_id),
             "requested_suggestions": payload.num_suggestions,
             "engine": "music_transformer",
+            "primer_section": payload.primer_section,
+            "target_section": payload.target_section,
         },
     )
     try:

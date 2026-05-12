@@ -9,6 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Probability = Annotated[float, Field(ge=0, le=1)]
 
+# Song-form section labels exposed to the continuation pipeline. The literal
+# is kept tight (verse/pre_chorus/chorus/bridge) because BiMMuDa-derived
+# transition priors are only reliable for these; instrumental and post_chorus
+# are deliberately excluded from the UI.
+Section = Literal["verse", "pre_chorus", "chorus", "bridge"]
+
 
 class SchemaModel(BaseModel):
     model_config = ConfigDict(ser_json_bytes="base64", val_json_bytes="base64")
@@ -355,10 +361,96 @@ class ChordProgression(SchemaModel):
     chord_explanations: list[ChordExplanation] = Field(default_factory=list)
 
 
+class RefinementOp(SchemaModel):
+    target: Literal["harmonizer", "melody_generator", "lyric_generator", "session"]
+    params: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = Field(..., min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_params_for_target(self):
+        _validate_refinement_params(self.target, self.params)
+        return self
+
+
 class RefinementPlan(SchemaModel):
-    target_pipeline: Literal["harmonizer", "melody_generator", "both", "lyric_generator", "session"]
-    parameter_adjustments: dict[str, Any] = Field(default_factory=dict)
+    operations: list[RefinementOp] = Field(..., min_length=1)
     interpretation: str = Field(..., min_length=1)
+
+
+_REFINEMENT_PARAM_RULES: dict[str, dict[str, Any]] = {
+    "harmonizer": {
+        "requested_target": "str",
+        "chord_complexity": {"low", "medium", "high"},
+        "extensions": "list[str]",
+        "emotion_valence": (-1.0, 1.0),
+        "emotion_valence_delta": (-1.0, 1.0),
+        "prefer_minor_color": "bool",
+        "reduce_minor_bias": "bool",
+        "section": "str",
+        "tension": {"lower", "low", "medium", "higher", "high"},
+    },
+    "melody_generator": {
+        "requested_target": "str",
+        "contour": {"rising", "falling", "arch", "valley", "varied"},
+        "rhythmic_density": {"lighter", "steady", "denser"},
+        "length": {"shorter", "longer", "unchanged"},
+        "section": "str",
+        "smooth_contour": "bool",
+        "register_shift": {"slightly_up", "slightly_down", "up", "down", "none"},
+    },
+    "lyric_generator": {
+        "requested_target": "str",
+        "imagery": "str",
+        "num_options": (1, 5),
+        "preserve_syllable_targets": "bool",
+        "section": "str",
+        "language": {"en", "ru"},
+        "length": {"shorter", "longer", "unchanged"},
+        "preserve_phrase": "str",
+    },
+    "session": {
+        "requested_target": "str",
+        "preserve": "list[str]",
+        "emotion": "str",
+        "genre": "str",
+        "mood": "str",
+    },
+}
+
+
+def _validate_refinement_params(target: str, params: dict[str, Any]) -> None:
+    rules = _REFINEMENT_PARAM_RULES[target]
+    unknown = sorted(set(params) - set(rules))
+    if unknown:
+        raise ValueError(f"Unknown params for {target}: {', '.join(unknown)}")
+    for name, value in params.items():
+        _validate_refinement_param(target, name, value, rules[name])
+
+
+def _validate_refinement_param(target: str, name: str, value: Any, rule: Any) -> None:
+    if rule == "str":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{target}.{name} must be a non-empty string")
+        return
+    if rule == "bool":
+        if not isinstance(value, bool):
+            raise ValueError(f"{target}.{name} must be boolean")
+        return
+    if rule == "list[str]":
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            raise ValueError(f"{target}.{name} must be a list of non-empty strings")
+        return
+    if isinstance(rule, set):
+        if value not in rule:
+            choices = ", ".join(sorted(str(item) for item in rule))
+            raise ValueError(f"{target}.{name} must be one of: {choices}")
+        return
+    if isinstance(rule, tuple):
+        lower, upper = rule
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < lower or value > upper:
+            raise ValueError(f"{target}.{name} must be between {lower} and {upper}")
+        return
+    raise ValueError(f"Unsupported refinement param rule for {target}.{name}")
 
 
 class ChatMessage(SchemaModel):
@@ -435,6 +527,13 @@ class SessionState(SchemaModel):
     chat_history: list[ChatMessage] = Field(default_factory=list)
     user_params: dict[str, Any] = Field(default_factory=dict)
     history: list[Action] = Field(default_factory=list)
+    # Optional song-form labels. When both are set, the continuation
+    # pipeline switches to BiMMuDa-conditional constraints (e.g. verse
+    # primer + chorus target -> expect register lift, slight density drop).
+    # When either is None, the pipeline falls back to primer-relative
+    # constraints (continue stylistically near the primer).
+    primer_section: Section | None = None
+    target_section: Section | None = None
 
 
 class SessionSummary(SchemaModel):
