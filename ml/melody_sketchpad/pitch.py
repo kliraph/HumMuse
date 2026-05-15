@@ -1,21 +1,21 @@
-"""Pitch extraction helpers for melody sketchpad."""
+"""Pitch extraction helpers for melody sketchpad.
+
+PESTO (Riou et al., ISMIR 2023) is used as the monophonic f0 backbone. A
+median-filtered jump-threshold segmenter then collapses frame-wise pitch
+into note events. PESTO replaced Basic Pitch because Basic Pitch is a
+polyphonic instrument transcriber and oversegments humming on overtone
+fluctuations.
+"""
 
 from __future__ import annotations
 
-import importlib.util
-import tempfile
 from dataclasses import dataclass, field
 from importlib import import_module
-from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 
-from ml.melody_sketchpad.notes import basic_pitch_notes_to_events, confidence_to_velocity
+from ml.melody_sketchpad.notes import confidence_to_velocity
 from shared.schemas import NoteEvent
-
-basic_pitch_inference = None
-ICASSP_2022_MODEL_PATH = None
 
 try:
     import librosa
@@ -29,42 +29,37 @@ DEFAULT_PITCHED_RATIO_THRESHOLD = 0.4
 DEFAULT_FALLBACK_PITCH = 60
 DEFAULT_ONSET_HOP_LENGTH = 512
 DEFAULT_RHYTHM_CONFIDENCE_FLOOR = 0.2
+DEFAULT_PESTO_STEP_MS = 10.0
+DEFAULT_VOICING_THRESHOLD = 0.5
+DEFAULT_MAX_JUMP_SEMITONES = 1.0
+
+_pesto_predict = None
 
 
 def seed_from_size(size: int) -> int:
     return max(1, min(size // 1000, 4))
 
 
-def _basic_pitch_is_available() -> bool:
-    _ensure_basic_pitch_loaded()
-    return basic_pitch_inference is not None and ICASSP_2022_MODEL_PATH is not None
-
-
-def _ensure_basic_pitch_loaded() -> None:
-    global basic_pitch_inference, ICASSP_2022_MODEL_PATH
-    if basic_pitch_inference is not None and ICASSP_2022_MODEL_PATH is not None:
+def _ensure_pesto_loaded() -> None:
+    global _pesto_predict
+    if _pesto_predict is not None:
         return
-    try:
-        basic_pitch_module = import_module("basic_pitch")
-        basic_pitch_inference = import_module("basic_pitch.inference")
-        ICASSP_2022_MODEL_PATH = getattr(basic_pitch_module, "ICASSP_2022_MODEL_PATH")
-    except ModuleNotFoundError:  # pragma: no cover - optional dependency until installed in the env
-        basic_pitch_inference = None
-        ICASSP_2022_MODEL_PATH = None
+    pesto_module = import_module("pesto")
+    _pesto_predict = pesto_module.predict
 
 
-def _resolve_model_path() -> str | Path:
-    if not _basic_pitch_is_available():
-        raise RuntimeError("basic_pitch is not available in the current Python environment")
+def _pesto_extract_frames(
+    audio: np.ndarray, sample_rate: int, *, step_ms: float = DEFAULT_PESTO_STEP_MS
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Run PESTO and return (pitch_hz, confidence, hop_seconds)."""
+    _ensure_pesto_loaded()
+    import torch  # imported lazily so tests that monkeypatch this helper don't pay the cost
 
-    base_model_path = Path(str(ICASSP_2022_MODEL_PATH))
-    onnx_model_path = base_model_path.with_suffix(".onnx")
-    if importlib.util.find_spec("onnxruntime") is not None and onnx_model_path.exists():
-        # basic_pitch always probes TensorFlow first; flipping these flags steers the loader to ONNX.
-        basic_pitch_inference.TF_PRESENT = False
-        basic_pitch_inference.TFLITE_PRESENT = False
-        return onnx_model_path
-    return base_model_path
+    waveform = np.ascontiguousarray(audio, dtype=np.float32)
+    audio_tensor = torch.from_numpy(waveform)
+    _, pitch_hz, confidence, _ = _pesto_predict(audio_tensor, sample_rate, step_size=float(step_ms))
+    return pitch_hz.detach().cpu().numpy(), confidence.detach().cpu().numpy(), float(step_ms) / 1000.0
+
 
 @dataclass(frozen=True)
 class PitchConfidenceResult:
@@ -197,6 +192,82 @@ def detect_rhythm_fallback(
     return events
 
 
+def _segment_pitch_frames(
+    pitch_hz: np.ndarray,
+    confidence: np.ndarray,
+    hop_s: float,
+    *,
+    minimum_frequency: float,
+    maximum_frequency: float,
+    minimum_note_length_ms: float,
+    voicing_threshold: float = DEFAULT_VOICING_THRESHOLD,
+    max_jump_semitones: float = DEFAULT_MAX_JUMP_SEMITONES,
+) -> list[NoteEvent]:
+    """Collapse frame-wise (Hz, confidence) into note events."""
+    if pitch_hz.shape != confidence.shape or pitch_hz.size == 0:
+        return []
+
+    voiced = (
+        (confidence > voicing_threshold)
+        & (pitch_hz >= minimum_frequency)
+        & (pitch_hz <= maximum_frequency)
+        & np.isfinite(pitch_hz)
+    )
+    midi = np.full(pitch_hz.shape, np.nan, dtype=np.float64)
+    midi[voiced] = 69.0 + 12.0 * np.log2(pitch_hz[voiced] / 440.0)
+
+    min_frames = max(1, int(np.ceil((float(minimum_note_length_ms) / 1000.0) / hop_s)))
+
+    events: list[NoteEvent] = []
+    cur_midi: list[float] = []
+    cur_conf: list[float] = []
+    cur_start: int | None = None
+
+    def flush(end_frame: int) -> None:
+        nonlocal cur_midi, cur_conf, cur_start
+        if cur_start is None or len(cur_midi) < min_frames:
+            return
+        pitch = int(round(float(np.median(cur_midi))))
+        if pitch < 0 or pitch > 127:
+            return
+        onset = cur_start * hop_s
+        duration = max(hop_s, (end_frame - cur_start) * hop_s)
+        mean_conf = float(np.clip(np.mean(cur_conf), 0.0, 1.0))
+        events.append(
+            NoteEvent(
+                pitch=pitch,
+                onset=onset,
+                duration=duration,
+                velocity=confidence_to_velocity(mean_conf),
+                confidence=mean_conf,
+            )
+        )
+
+    for i, m in enumerate(midi):
+        if not np.isfinite(m):
+            flush(i)
+            cur_midi = []
+            cur_conf = []
+            cur_start = None
+            continue
+        if cur_start is None:
+            cur_start = i
+            cur_midi = [float(m)]
+            cur_conf = [float(confidence[i])]
+            continue
+        if abs(m - float(np.median(cur_midi))) > max_jump_semitones:
+            flush(i)
+            cur_start = i
+            cur_midi = [float(m)]
+            cur_conf = [float(confidence[i])]
+        else:
+            cur_midi.append(float(m))
+            cur_conf.append(float(confidence[i]))
+    flush(len(midi))
+
+    return events
+
+
 def extract_melody(
     audio: np.ndarray,
     sample_rate: int,
@@ -205,31 +276,19 @@ def extract_melody(
     maximum_frequency: float = DEFAULT_MAXIMUM_FREQUENCY,
     minimum_note_length_ms: float = DEFAULT_MINIMUM_NOTE_LENGTH_MS,
 ) -> list[NoteEvent]:
-    """Extract monophonic note events with Basic Pitch."""
-    if audio.size == 0:
+    """Extract monophonic note events with PESTO + median-filter segmenter."""
+    if audio.size == 0 or sample_rate <= 0:
         return []
-    if not _basic_pitch_is_available():
-        raise RuntimeError("basic_pitch is not available in the current Python environment")
-
     waveform = np.clip(audio.astype(np.float32, copy=False), -1.0, 1.0)
-    model_path = _resolve_model_path()
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-        temp_path = Path(temp_file.name)
-    try:
-        minimum_note_length_seconds = max(0.0, float(minimum_note_length_ms)) / 1000.0
-        sf.write(temp_path, waveform, sample_rate)
-        _, _, note_events = basic_pitch_inference.predict(
-            str(temp_path),
-            model_or_model_path=model_path,
-            minimum_frequency=minimum_frequency,
-            maximum_frequency=maximum_frequency,
-            minimum_note_length=minimum_note_length_seconds,
-        )
-    finally:
-        temp_path.unlink(missing_ok=True)
-
-    return basic_pitch_notes_to_events(note_events)
+    pitch_hz, confidence, hop_s = _pesto_extract_frames(waveform, sample_rate)
+    return _segment_pitch_frames(
+        pitch_hz,
+        confidence,
+        hop_s,
+        minimum_frequency=minimum_frequency,
+        maximum_frequency=maximum_frequency,
+        minimum_note_length_ms=minimum_note_length_ms,
+    )
 
 
 def extract_melody_with_confidence(

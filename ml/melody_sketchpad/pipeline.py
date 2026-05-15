@@ -128,6 +128,10 @@ def _load_audio_with_fallback(audio_bytes: bytes) -> tuple[Any, bool, str | None
         return fallback, True, str(exc)
 
 
+class NoMelodyDetectedError(ValueError):
+    """Raised when the extractor finds no melodic content in the audio."""
+
+
 def _extract_melody_notes(
     audio: Any,
     sample_rate: int,
@@ -142,22 +146,18 @@ def _extract_melody_notes(
         meta["melody_source"] = "mock_decode_fallback"
         return _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood), meta
 
-    try:
-        confidence_result = extract_melody_or_fallback(audio, sample_rate)
-    except Exception as exc:
-        meta["melody_source"] = "mock_extractor_error"
-        meta["melody_extractor_error"] = str(exc)
-        return _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood), meta
-
+    confidence_result = extract_melody_or_fallback(audio, sample_rate)
     meta["pitched_ratio"] = round(float(confidence_result.pitched_ratio), 4)
     meta["raw_note_count"] = len(confidence_result.notes)
 
     if not confidence_result.notes:
-        meta["melody_source"] = "mock_no_notes_detected"
-        return _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood), meta
+        raise NoMelodyDetectedError(
+            "No melody detected in the uploaded audio. Try recording a clearer hum, "
+            "closer to the microphone, with sustained pitched notes."
+        )
 
     meta["melody_source"] = (
-        "basic_pitch_rhythm_fallback" if confidence_result.used_fallback else "basic_pitch"
+        "pesto_rhythm_fallback" if confidence_result.used_fallback else "pesto"
     )
     melody = note_events_to_melody_notes(confidence_result.notes, tempo_bpm=tempo_bpm)
     return melody, meta
@@ -198,20 +198,19 @@ def _build_explanation(
         preprocessing_detail = (
             "Audio decoding fell back to a deterministic silent proxy, so the later stages stayed reproducible."
         )
-    elif melody_source == "basic_pitch":
+    elif melody_source == "pesto":
         preprocessing_detail = (
-            f"Audio was decoded to {processed_samples} mono samples and Basic Pitch extracted "
-            f"{raw_note_count} raw notes before quantize and smoothing."
+            f"Audio was decoded to {processed_samples} mono samples and PESTO extracted "
+            f"{raw_note_count} note events before quantize and smoothing."
         )
-    elif melody_source == "basic_pitch_rhythm_fallback":
+    elif melody_source == "pesto_rhythm_fallback":
         preprocessing_detail = (
             f"Audio was decoded to {processed_samples} mono samples; pitch confidence was low, "
             "so rhythm-only onsets were used."
         )
     else:
         preprocessing_detail = (
-            f"Audio was decoded to {processed_samples} mono samples, but melody extraction "
-            f"({melody_source}) fell back to a deterministic mock arpeggio."
+            f"Audio was decoded to {processed_samples} mono samples (melody_source={melody_source})."
         )
     return [
         ExplanationPart(

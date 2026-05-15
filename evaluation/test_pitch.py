@@ -1,8 +1,6 @@
-"""Tests for Basic Pitch melody extraction."""
+"""Tests for PESTO-based melody extraction."""
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import numpy as np
 
@@ -10,59 +8,71 @@ import ml.melody_sketchpad.pitch as pitch_module
 from shared.schemas import NoteEvent
 
 
-class _PredictRecorder:
-    def __init__(self, note_events: list[tuple[float, float, int, float, list[int] | None]]) -> None:
-        self.note_events = note_events
-        self.calls: list[dict[str, object]] = []
+def _frames_for(midi_pitches: list[float], frames_per_note: int, confidence: float = 0.9):
+    """Build PESTO-style (pitch_hz, confidence, hop_s) arrays from a list of MIDI pitches."""
+    pitch_hz = []
+    conf = []
+    for midi in midi_pitches:
+        hz = 440.0 * (2 ** ((float(midi) - 69) / 12.0)) if np.isfinite(midi) else 0.0
+        c = confidence if np.isfinite(midi) else 0.0
+        for _ in range(frames_per_note):
+            pitch_hz.append(hz)
+            conf.append(c)
+    return np.asarray(pitch_hz, dtype=np.float64), np.asarray(conf, dtype=np.float64), 0.010
 
-    def predict(self, audio_path: str, **kwargs):
-        self.calls.append({"audio_path": audio_path, **kwargs})
-        return {}, None, self.note_events
 
-
-def test_extract_melody_maps_basic_pitch_events_to_note_events(monkeypatch) -> None:
-    recorder = _PredictRecorder(
-        [
-            (0.15, 0.55, 69, 0.82, None),
-            (0.60, 0.92, 71, 0.31, None),
-        ]
-    )
-    monkeypatch.setattr(pitch_module, "basic_pitch_inference", recorder)
-    monkeypatch.setattr(pitch_module, "ICASSP_2022_MODEL_PATH", "mock-model")
-    monkeypatch.setattr(pitch_module, "_resolve_model_path", lambda: "resolved-model")
+def test_extract_melody_segments_two_note_phrase(monkeypatch) -> None:
+    hz, conf, hop_s = _frames_for([69.0, 71.0], frames_per_note=20, confidence=0.85)
+    monkeypatch.setattr(pitch_module, "_pesto_extract_frames", lambda *a, **kw: (hz, conf, hop_s))
 
     events = pitch_module.extract_melody(np.ones(16_000, dtype=np.float32) * 0.1, 16_000)
 
     assert len(events) == 2
     assert events[0].pitch == 69
-    assert events[0].onset == 0.15
-    assert round(events[0].duration, 2) == 0.40
-    assert events[0].confidence == 0.82
-    assert events[0].velocity == 104
+    assert events[0].onset == 0.0
+    assert round(events[0].duration, 2) == 0.20
+    assert events[0].confidence > 0.8
     assert events[1].pitch == 71
+    assert round(events[1].onset, 2) == 0.20
 
 
-def test_extract_melody_calls_basic_pitch_with_phase_3_4_config(monkeypatch) -> None:
-    recorder = _PredictRecorder([(0.0, 0.1, 69, 0.5, None)])
-    monkeypatch.setattr(pitch_module, "basic_pitch_inference", recorder)
-    monkeypatch.setattr(pitch_module, "ICASSP_2022_MODEL_PATH", "mock-model")
-    monkeypatch.setattr(pitch_module, "_resolve_model_path", lambda: "resolved-model")
+def test_extract_melody_drops_segments_below_minimum_length(monkeypatch) -> None:
+    # 50ms of 69, 50ms of 71 — both below the 80ms minimum
+    hz, conf, hop_s = _frames_for([69.0, 71.0], frames_per_note=5, confidence=0.9)
+    monkeypatch.setattr(pitch_module, "_pesto_extract_frames", lambda *a, **kw: (hz, conf, hop_s))
 
-    events = pitch_module.extract_melody(np.ones(8_000, dtype=np.float32) * 0.1, 16_000)
+    events = pitch_module.extract_melody(np.ones(16_000, dtype=np.float32) * 0.1, 16_000)
 
-    assert len(events) == 1
-    assert len(recorder.calls) == 1
-    call = recorder.calls[0]
-    assert call["model_or_model_path"] == "resolved-model"
-    assert call["minimum_frequency"] == pitch_module.DEFAULT_MINIMUM_FREQUENCY
-    assert call["maximum_frequency"] == pitch_module.DEFAULT_MAXIMUM_FREQUENCY
-    assert call["minimum_note_length"] == pitch_module.DEFAULT_MINIMUM_NOTE_LENGTH_MS / 1000.0
-    assert Path(str(call["audio_path"])).suffix == ".wav"
+    assert events == []
+
+
+def test_extract_melody_drops_unvoiced_frames(monkeypatch) -> None:
+    # Voiced 69, unvoiced gap, voiced 71. Builder uses NaN to mark unvoiced.
+    hz, conf, hop_s = _frames_for([69.0, float("nan"), 71.0], frames_per_note=15)
+    monkeypatch.setattr(pitch_module, "_pesto_extract_frames", lambda *a, **kw: (hz, conf, hop_s))
+
+    events = pitch_module.extract_melody(np.ones(16_000, dtype=np.float32) * 0.1, 16_000)
+
+    assert len(events) == 2
+    assert events[0].pitch == 69
+    assert events[1].pitch == 71
+    # Unvoiced 150ms gap between them
+    assert round(events[1].onset - (events[0].onset + events[0].duration), 2) == 0.15
+
+
+def test_extract_melody_gates_out_of_band_frequencies(monkeypatch) -> None:
+    # Voiced frames at 50 Hz (below 80 Hz floor) should be discarded
+    hz = np.full(30, 50.0, dtype=np.float64)
+    conf = np.full(30, 0.9, dtype=np.float64)
+    monkeypatch.setattr(pitch_module, "_pesto_extract_frames", lambda *a, **kw: (hz, conf, 0.010))
+
+    events = pitch_module.extract_melody(np.ones(16_000, dtype=np.float32) * 0.1, 16_000)
+
+    assert events == []
 
 
 def test_extract_melody_returns_empty_list_for_empty_audio() -> None:
     events = pitch_module.extract_melody(np.array([], dtype=np.float32), 16_000)
-
     assert events == []
 
 

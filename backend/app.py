@@ -55,7 +55,7 @@ from ml.harmony import generate_chords as generate_dqn_chords
 from ml.melody_sketchpad.continuation.constraints import chord_symbol_to_pitch_classes
 from ml.lyrics_to_chords.service import generate_from_lyrics
 from ml.melody_sketchpad.continuation.pipeline import continue_melody as run_continuation_pipeline
-from ml.melody_sketchpad.pipeline import run_melody_pipeline
+from ml.melody_sketchpad.pipeline import NoMelodyDetectedError, run_melody_pipeline
 from ml.melody_sketchpad.profile import build_melody_profile
 from ml.writers_block.service import generate_help
 from shared.schemas import ChordProgression, MelodySuggestion, NoteEvent, SessionState, SessionSummary
@@ -317,19 +317,20 @@ async def melody_from_hum(
             {"filename": audio.filename or "audio", "tempo_bpm": tempo_bpm, "prompt": prompt},
         )
         melody_source = melody_result.metadata.get("melody_source", "unknown")
-        if melody_source == "basic_pitch":
+        if melody_source == "pesto":
             extraction_summary = (
-                f"Basic Pitch extracted {melody_result.metadata.get('raw_note_count', 0)} raw notes "
+                f"PESTO extracted {melody_result.metadata.get('raw_note_count', 0)} note events "
                 f"(pitched ratio {melody_result.metadata.get('pitched_ratio', 0.0):.2f}); "
                 "quantize+smooth produced the session melody profile."
             )
-        elif melody_source == "basic_pitch_rhythm_fallback":
+        elif melody_source == "pesto_rhythm_fallback":
             extraction_summary = (
                 "Pitch confidence was low, so rhythm-only onsets were used to seed the melody profile."
             )
         else:
             extraction_summary = (
-                f"Real extraction unavailable ({melody_source}); fell back to deterministic mock melody."
+                f"Audio decoding fell back to a silent proxy (melody_source={melody_source}); "
+                "a deterministic placeholder melody was returned so downstream stages stayed reproducible."
             )
         _update_explanation_report(
             state,
@@ -349,6 +350,9 @@ async def melody_from_hum(
             run_id=run_id,
             explanation=melody_result.explanation,
         )
+    except NoMelodyDetectedError as exc:
+        experiment_logger.finish_run(run_id, error=exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
         experiment_logger.finish_run(run_id, error=exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
