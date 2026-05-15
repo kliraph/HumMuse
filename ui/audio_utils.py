@@ -25,7 +25,10 @@ def decode_midi_bytes(value: str | bytes | None) -> bytes | None:
         return None
     if isinstance(value, bytes):
         return value
-    return base64.b64decode(value)
+    # Pydantic v2 with ser_json_bytes="base64" emits URL-safe base64
+    # WITHOUT padding, so restore the padding before decoding.
+    padding = (-len(value)) % 4
+    return base64.urlsafe_b64decode(value + ("=" * padding))
 
 
 def midi_pitch_to_frequency(midi_pitch: int) -> float:

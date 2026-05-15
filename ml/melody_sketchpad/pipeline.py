@@ -11,8 +11,8 @@ import soundfile as sf
 from ml.melody_sketchpad.chord_suggest import suggest_chords
 from ml.melody_sketchpad.key_detect import detect_key
 from ml.melody_sketchpad.midi_export import notes_to_midi
-from ml.melody_sketchpad.notes import melody_notes_to_events
-from ml.melody_sketchpad.pitch import seed_from_size
+from ml.melody_sketchpad.notes import melody_notes_to_events, note_events_to_melody_notes
+from ml.melody_sketchpad.pitch import extract_melody_or_fallback, seed_from_size
 from ml.melody_sketchpad.preprocess import (
     DEFAULT_SAMPLE_RATE,
     audio_size,
@@ -63,8 +63,16 @@ def run_melody_pipeline(
     timings["preprocess_audio"] = _elapsed_ms(preprocess_started)
 
     notes_started = time.perf_counter()
-    melody = _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood)
+    melody, extraction_meta = _extract_melody_notes(
+        processed_audio,
+        DEFAULT_SAMPLE_RATE,
+        audio_bytes=audio_bytes,
+        tempo_bpm=tempo_bpm,
+        mood=mood,
+        used_audio_fallback=used_audio_fallback,
+    )
     timings["generate_notes"] = _elapsed_ms(notes_started)
+    metadata.update(extraction_meta)
 
     quantize_started = time.perf_counter()
     quantized = quantize_notes(melody)
@@ -92,6 +100,8 @@ def run_melody_pipeline(
     explanation = _build_explanation(
         used_audio_fallback=used_audio_fallback,
         processed_samples=int(processed_audio.shape[0]),
+        melody_source=str(metadata.get("melody_source", "unknown")),
+        raw_note_count=int(metadata.get("raw_note_count", 0)),
     )
     timings["assemble_outputs"] = _elapsed_ms(explain_started)
 
@@ -118,6 +128,41 @@ def _load_audio_with_fallback(audio_bytes: bytes) -> tuple[Any, bool, str | None
         return fallback, True, str(exc)
 
 
+def _extract_melody_notes(
+    audio: Any,
+    sample_rate: int,
+    *,
+    audio_bytes: bytes,
+    tempo_bpm: int | None,
+    mood: str | None,
+    used_audio_fallback: bool,
+) -> tuple[list[MelodyNote], dict[str, Any]]:
+    meta: dict[str, Any] = {}
+    if used_audio_fallback:
+        meta["melody_source"] = "mock_decode_fallback"
+        return _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood), meta
+
+    try:
+        confidence_result = extract_melody_or_fallback(audio, sample_rate)
+    except Exception as exc:
+        meta["melody_source"] = "mock_extractor_error"
+        meta["melody_extractor_error"] = str(exc)
+        return _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood), meta
+
+    meta["pitched_ratio"] = round(float(confidence_result.pitched_ratio), 4)
+    meta["raw_note_count"] = len(confidence_result.notes)
+
+    if not confidence_result.notes:
+        meta["melody_source"] = "mock_no_notes_detected"
+        return _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood), meta
+
+    meta["melody_source"] = (
+        "basic_pitch_rhythm_fallback" if confidence_result.used_fallback else "basic_pitch"
+    )
+    melody = note_events_to_melody_notes(confidence_result.notes, tempo_bpm=tempo_bpm)
+    return melody, meta
+
+
 def _generate_mock_melody(
     audio_bytes: bytes,
     *,
@@ -142,12 +187,32 @@ def _generate_mock_melody(
     ]
 
 
-def _build_explanation(*, used_audio_fallback: bool, processed_samples: int) -> list[ExplanationPart]:
-    preprocessing_detail = (
-        "Audio decoding fell back to a deterministic silent proxy, so the later stages stayed reproducible."
-        if used_audio_fallback
-        else f"Audio was decoded and preprocessed to {processed_samples} mono samples before symbolic conversion."
-    )
+def _build_explanation(
+    *,
+    used_audio_fallback: bool,
+    processed_samples: int,
+    melody_source: str,
+    raw_note_count: int,
+) -> list[ExplanationPart]:
+    if used_audio_fallback:
+        preprocessing_detail = (
+            "Audio decoding fell back to a deterministic silent proxy, so the later stages stayed reproducible."
+        )
+    elif melody_source == "basic_pitch":
+        preprocessing_detail = (
+            f"Audio was decoded to {processed_samples} mono samples and Basic Pitch extracted "
+            f"{raw_note_count} raw notes before quantize and smoothing."
+        )
+    elif melody_source == "basic_pitch_rhythm_fallback":
+        preprocessing_detail = (
+            f"Audio was decoded to {processed_samples} mono samples; pitch confidence was low, "
+            "so rhythm-only onsets were used."
+        )
+    else:
+        preprocessing_detail = (
+            f"Audio was decoded to {processed_samples} mono samples, but melody extraction "
+            f"({melody_source}) fell back to a deterministic mock arpeggio."
+        )
     return [
         ExplanationPart(
             title="Pipeline",

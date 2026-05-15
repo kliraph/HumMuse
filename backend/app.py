@@ -316,10 +316,25 @@ async def melody_from_hum(
             "melody_uploaded",
             {"filename": audio.filename or "audio", "tempo_bpm": tempo_bpm, "prompt": prompt},
         )
+        melody_source = melody_result.metadata.get("melody_source", "unknown")
+        if melody_source == "basic_pitch":
+            extraction_summary = (
+                f"Basic Pitch extracted {melody_result.metadata.get('raw_note_count', 0)} raw notes "
+                f"(pitched ratio {melody_result.metadata.get('pitched_ratio', 0.0):.2f}); "
+                "quantize+smooth produced the session melody profile."
+            )
+        elif melody_source == "basic_pitch_rhythm_fallback":
+            extraction_summary = (
+                "Pitch confidence was low, so rhythm-only onsets were used to seed the melody profile."
+            )
+        else:
+            extraction_summary = (
+                f"Real extraction unavailable ({melody_source}); fell back to deterministic mock melody."
+            )
         _update_explanation_report(
             state,
             source_action="melody_from_hum",
-            summary="Mock melody extraction produced confidence-tagged notes and a session melody profile.",
+            summary=extraction_summary,
         )
         _save_session(state)
 
