@@ -100,6 +100,12 @@ class SuggestLyricsRequest(BaseModel):
 class SuggestLyricsResponse(BaseModel):
     session_id: UUID
     lyric_suggestions: list[LyricSuggestion] = Field(default_factory=list)
+    source: str = Field(default="fallback")
+    mode: str | None = None
+    model_version: str | None = None
+    cache_hit: bool = False
+    latency_ms: float | None = None
+    error: str | None = None
 
 
 class WriterBlockHelpRequest(BaseModel):
@@ -126,6 +132,12 @@ class SessionChatResponse(BaseModel):
     reply: ChatMessage
     chat_history: list[ChatMessage] = Field(default_factory=list)
     explanation_report: ExplanationReport | None = None
+    reply_source: str = Field(default="fallback")
+    reply_model_version: str | None = None
+    reply_cache_hit: bool = False
+    reply_latency_ms: float | None = None
+    reply_limits: str | None = None
+    reply_error: str | None = None
 
 
 class ArtifactListingResponse(BaseModel):

@@ -38,17 +38,19 @@ from backend.logging_config import (
     get_request_context,
     initialize_request_context,
 )
+from backend.chat_responder import build_chat_reply
+from backend.explain import build_explanation_report
+from backend.lyric_responder import generate_lyric_suggestions
 from backend.mock_pipeline import (
     add_history,
     append_chat_message,
-    build_chat_reply,
     build_emotion_vector,
-    build_explanation_report,
-    build_lyric_suggestions,
     build_progressions,
-    build_refinement_plan,
 )
+from backend.refinement_executor import execute_refinement_plan
+from backend.refinement_parser import parse_refinement_instruction
 from backend.session import SessionManager, SessionNotFoundError
+from ml.gpt.pipeline import GPTPipeline, ResponseCache
 from ml.harmony import generate_chords as generate_dqn_chords
 from ml.melody_sketchpad.continuation.constraints import chord_symbol_to_pitch_classes
 from ml.lyrics_to_chords.service import generate_from_lyrics
@@ -65,6 +67,25 @@ database = Database()
 session_manager = SessionManager(database)
 experiment_logger = ExperimentLogger()
 request_logger = get_logger("backend.api")
+
+_gpt_pipeline: GPTPipeline | None = None
+_gpt_pipeline_init_failed: bool = False
+
+
+def _get_gpt_pipeline() -> GPTPipeline | None:
+    """Lazily construct a shared GPTPipeline; return None if config is missing."""
+    global _gpt_pipeline, _gpt_pipeline_init_failed
+    if _gpt_pipeline is not None:
+        return _gpt_pipeline
+    if _gpt_pipeline_init_failed:
+        return None
+    try:
+        _gpt_pipeline = GPTPipeline.from_env(cache=ResponseCache(database))
+    except Exception as exc:
+        request_logger.info("gpt_pipeline_init_failed", error=str(exc), error_type=exc.__class__.__name__)
+        _gpt_pipeline_init_failed = True
+        return None
+    return _gpt_pipeline
 
 
 def _infer_pipeline_stage(endpoint: str) -> str:
@@ -542,18 +563,50 @@ def accept_melody_continuation(request: Request, payload: MelodyAcceptRequest) -
 def suggest_lyrics(request: Request, payload: SuggestLyricsRequest) -> SuggestLyricsResponse:
     bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="lyrics", use_case="lyric")
     state = _get_session_or_404(str(payload.session_id))
-    state.lyric_suggestions = build_lyric_suggestions(state, payload.mode, payload.num_suggestions)
-    add_history(state, "lyrics_suggested", {"count": payload.num_suggestions, "mode": payload.mode})
+    result = generate_lyric_suggestions(
+        state,
+        mode=payload.mode,
+        num_suggestions=payload.num_suggestions,
+        pipeline=_get_gpt_pipeline(),
+    )
+    state.lyric_suggestions = result.suggestions
+    state.user_params["last_lyric_source"] = result.source
+    state.user_params["last_lyric_mode"] = result.mode
+    state.user_params["last_lyric_model_version"] = result.model_version
+    state.user_params["last_lyric_cache_hit"] = result.cache_hit
+    state.user_params["last_lyric_latency_ms"] = result.latency_ms
+    state.user_params["last_lyric_error"] = result.error
+    add_history(
+        state,
+        "lyrics_suggested",
+        {
+            "count": payload.num_suggestions,
+            "mode": payload.mode,
+            "source": result.source,
+            "error": result.error,
+        },
+    )
+    summary = (
+        "GPT lyric suggestion grounded its options in the active session context."
+        if result.source == "gpt"
+        else "Mock lyric suggestion generation used the active session context and lyric mode selector."
+    )
     _update_explanation_report(
         state,
         source_action="suggest_lyrics",
-        summary="Mock lyric suggestion generation used the active session context and lyric mode selector.",
+        summary=summary,
         use_case="lyric",
     )
     _save_session(state)
     return SuggestLyricsResponse(
         session_id=state.session_id,
         lyric_suggestions=state.lyric_suggestions,
+        source=result.source,
+        mode=result.mode,
+        model_version=result.model_version,
+        cache_hit=result.cache_hit,
+        latency_ms=result.latency_ms,
+        error=result.error,
     )
 
 
@@ -561,15 +614,37 @@ def suggest_lyrics(request: Request, payload: SuggestLyricsRequest) -> SuggestLy
 def refine_session(request: Request, session_id: str, payload: RefineSessionRequest) -> SessionStateResponse:
     bind_request_context(request, session_id=session_id, pipeline_stage="session", use_case="refine")
     state = _get_session_or_404(session_id)
-    refinement_plan = build_refinement_plan(payload.instruction, payload.target)
+    pipeline = _get_gpt_pipeline()
+    parsed = parse_refinement_instruction(
+        state,
+        payload.instruction,
+        target_hint=payload.target,
+        pipeline=pipeline,
+    )
+    refinement_plan = parsed.plan
+    execution = execute_refinement_plan(state, refinement_plan, pipeline=pipeline)
+
     state.user_params["last_refinement"] = payload.instruction
     state.user_params["last_refinement_target"] = payload.target or "session"
     state.user_params["last_refinement_plan"] = refinement_plan.model_dump()
     state.user_params["last_refinement_interpretation"] = refinement_plan.interpretation
+    state.user_params["last_refinement_source"] = parsed.source
+    state.user_params["last_refinement_model_version"] = parsed.model_version
+    state.user_params["last_refinement_cache_hit"] = parsed.cache_hit
+    state.user_params["last_refinement_latency_ms"] = parsed.latency_ms
+    state.user_params["last_refinement_error"] = parsed.error
+    state.user_params["last_refinement_execution"] = execution.to_dict()
     add_history(
         state,
         "session_refined",
-        {"instruction": payload.instruction, "target": payload.target, "plan": refinement_plan.model_dump()},
+        {
+            "instruction": payload.instruction,
+            "target": payload.target,
+            "plan": refinement_plan.model_dump(),
+            "source": parsed.source,
+            "error": parsed.error,
+            "execution": execution.to_dict(),
+        },
     )
     _update_explanation_report(
         state,
@@ -586,13 +661,34 @@ def session_chat(request: Request, session_id: str, payload: SessionChatRequest)
     bind_request_context(request, session_id=session_id, pipeline_stage="explanation", use_case="explain")
     state = _get_session_or_404(session_id)
     append_chat_message(state, "user", payload.message)
-    reply = build_chat_reply(state, payload.message)
+    chat_reply = build_chat_reply(state, payload.message, pipeline=_get_gpt_pipeline())
+    reply = chat_reply.message
     state.chat_history.append(reply)
-    add_history(state, "session_chat", {"message": payload.message})
+    state.user_params["last_chat_source"] = chat_reply.source
+    state.user_params["last_chat_model_version"] = chat_reply.model_version
+    state.user_params["last_chat_cache_hit"] = chat_reply.cache_hit
+    state.user_params["last_chat_latency_ms"] = chat_reply.latency_ms
+    state.user_params["last_chat_limits"] = chat_reply.limits
+    state.user_params["last_chat_error"] = chat_reply.error
+    add_history(
+        state,
+        "session_chat",
+        {
+            "message": payload.message,
+            "source": chat_reply.source,
+            "limits": chat_reply.limits,
+            "error": chat_reply.error,
+        },
+    )
+    summary = (
+        "GPT explanation dialog grounded the answer in the latest Tier 1 explanation report."
+        if chat_reply.source == "gpt"
+        else "Mock explanation dialog grounded its response in the latest structured explanation report."
+    )
     _update_explanation_report(
         state,
         source_action="session_chat",
-        summary="Mock explanation dialog grounded its response in the latest structured explanation report.",
+        summary=summary,
         use_case="explain",
     )
     _save_session(state)
@@ -601,6 +697,12 @@ def session_chat(request: Request, session_id: str, payload: SessionChatRequest)
         reply=reply,
         chat_history=state.chat_history,
         explanation_report=state.explanation_report,
+        reply_source=chat_reply.source,
+        reply_model_version=chat_reply.model_version,
+        reply_cache_hit=chat_reply.cache_hit,
+        reply_latency_ms=chat_reply.latency_ms,
+        reply_limits=chat_reply.limits,
+        reply_error=chat_reply.error,
     )
 
 

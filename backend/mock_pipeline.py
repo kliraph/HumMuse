@@ -11,7 +11,6 @@ from shared.schemas import (
     Action,
     ChatMessage,
     EmotionVector,
-    ExplanationReport,
     LyricSuggestion,
     MelodySuggestion,
     NoteEvent,
@@ -208,63 +207,6 @@ def build_refinement_plan(instruction: str, target: str | None = None) -> Refine
     return RefinementPlan(
         operations=operations,
         interpretation=interpretation,
-    )
-
-
-def build_explanation_report(
-    state: SessionState,
-    *,
-    source_action: str,
-    summary: str,
-    use_case: str | None = None,
-) -> ExplanationReport:
-    melody_confidence = [
-        {
-            "pitch": note.pitch,
-            "onset": note.onset,
-            "confidence": note.confidence,
-        }
-        for note in state.melody_notes
-    ]
-    constraint_logs = list(state.user_params.get("continuation_constraint_trace") or [])
-    if not constraint_logs:
-        constraint_logs = [
-            {
-                "candidate": index + 1,
-                "status": "accepted",
-                "reason": suggestion.explanation,
-                "score": suggestion.coherence_score,
-                "engine": suggestion.engine,
-            }
-            for index, suggestion in enumerate(state.melody_suggestions)
-        ]
-    chord_theory = [
-        {
-            "progression": progression.chords,
-            "harmonic_function": progression.harmonic_function,
-            "explanation": progression.explanation,
-            "annotations": [
-                annotation.model_dump()
-                for annotation in progression.chord_annotations
-            ],
-            "native_distribution_count": len(progression.native_distributions),
-        }
-        for progression in state.chord_progressions
-    ]
-    emotion_mapping = (
-        state.emotion_vector.model_dump()
-        if state.emotion_vector is not None
-        else {}
-    )
-    cache_status = {"use_case": use_case, "cache_hit": False} if use_case else {}
-    return ExplanationReport(
-        source_action=source_action,
-        summary=summary,
-        melody_confidence=melody_confidence,
-        constraint_logs=constraint_logs,
-        chord_theory=chord_theory,
-        emotion_mapping=emotion_mapping,
-        cache_status=cache_status,
     )
 
 

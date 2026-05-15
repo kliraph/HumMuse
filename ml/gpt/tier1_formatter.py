@@ -28,6 +28,10 @@ from typing import Any
 
 from shared.schemas import ChordProgression, ExplanationReport
 
+_PROMPT_COMPACT_MELODY_NOTES = 12
+_PROMPT_COMPACT_CONSTRAINT_LOGS = 6
+_PROMPT_COMPACT_TOP_PROGRESSIONS = 1
+
 _PITCH_CLASS_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
@@ -51,6 +55,68 @@ def format_tier1_summary(report: ExplanationReport | None) -> str:
     if emotion_section:
         sections.append(emotion_section)
     return "\n\n".join(sections)
+
+
+def compact_explanation_report_for_prompt(report: ExplanationReport | None) -> dict[str, Any] | None:
+    """Trim an :class:`ExplanationReport` down to what fits in a prompt context.
+
+    The full report (especially ``chord_theory[*].native_distributions``) can
+    blow past provider context limits (Yandex caps at 32k input tokens).
+    The prose summary from :func:`format_tier1_summary` already covers the
+    DQN Q-values / reward attributions / emotion bias, so the structured
+    copy that ships in the prompt only needs to be a *lookup table* for chord
+    symbols and roman numerals plus shallow session metadata. Heavy nested
+    arrays (native distributions, full chord explanations) are dropped here;
+    the UI still reads the full report from session state.
+    """
+    if report is None:
+        return None
+
+    compact: dict[str, Any] = {
+        "source_action": report.source_action,
+        "summary": report.summary,
+        "emotion_mapping": dict(report.emotion_mapping),
+        "cache_status": dict(report.cache_status),
+    }
+
+    if report.melody_confidence:
+        compact["melody_confidence"] = list(report.melody_confidence[:_PROMPT_COMPACT_MELODY_NOTES])
+        compact["melody_confidence_truncated"] = len(report.melody_confidence) > _PROMPT_COMPACT_MELODY_NOTES
+
+    if report.constraint_logs:
+        compact["constraint_logs"] = list(report.constraint_logs[:_PROMPT_COMPACT_CONSTRAINT_LOGS])
+        compact["constraint_logs_truncated"] = len(report.constraint_logs) > _PROMPT_COMPACT_CONSTRAINT_LOGS
+
+    if report.chord_theory:
+        compact["chord_theory"] = [
+            _compact_progression_entry(entry)
+            for entry in report.chord_theory[:_PROMPT_COMPACT_TOP_PROGRESSIONS]
+        ]
+        compact["chord_theory_truncated"] = len(report.chord_theory) > _PROMPT_COMPACT_TOP_PROGRESSIONS
+
+    return compact
+
+
+def _compact_progression_entry(entry: Mapping[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for key in ("chords", "harmonic_function", "explanation", "score", "model_confidence"):
+        if key in entry:
+            compact[key] = entry[key]
+    annotations = entry.get("annotations") or []
+    if isinstance(annotations, Sequence):
+        compact["annotations"] = [_compact_annotation(a) for a in annotations if isinstance(a, Mapping)]
+    # Drop native_distributions (heavy: 13-element membership arrays per
+    # position) and chord_explanations (per-position prose); the
+    # `tier1_natural_language` field carries that information already.
+    return compact
+
+
+def _compact_annotation(annotation: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: annotation[key]
+        for key in ("position", "symbol", "roman_numeral", "function_label", "template_phrase")
+        if key in annotation
+    }
 
 
 def format_chord_theory_from_progression(progression: ChordProgression) -> list[dict[str, Any]]:

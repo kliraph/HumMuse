@@ -11,7 +11,10 @@ from ml.gpt.context_builder import SessionContext
 EXPLANATION_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["answer"],
+    # Both keys are required so the schema works with providers that enforce
+    # strict mode by rejecting optional properties (e.g. Yandex Cloud).
+    # `limits` is allowed to be an empty string when nothing meaningful applies.
+    "required": ["answer", "limits"],
     "properties": {
         "answer": {
             "type": "string",
@@ -21,8 +24,8 @@ EXPLANATION_RESPONSE_SCHEMA: dict[str, Any] = {
         "limits": {
             "type": "string",
             "description": (
-                "Optional. Mention here only if a specific aspect of the question cannot be "
-                "addressed from the supplied session context."
+                "Brief note about anything the supplied session context cannot address. "
+                "Set to an empty string when the answer fully covers the question."
             ),
         },
     },
@@ -48,7 +51,7 @@ Style rules:
   - Talk about *why the choice feels right* and how it serves the song, not about probabilities, Q-values, reward components, percentages, or other internal numbers. Use the data to inform your judgement, not to quote it.
   - It is fine — and often better — to skip a chord-by-chord walkthrough and answer the spirit of the question.
   - If the user asks a general music-theory question that is not specifically about this session, answer it teacher-style without forcing a tie-in to the song.
-  - If something genuinely cannot be addressed from the supplied context, say so briefly in the optional limits field; do not invent details.
+  - The response has two required fields: `answer` and `limits`. Put your reply in `answer`. Use `limits` only when the supplied context genuinely cannot address part of the question — name what is missing in one short clause. Set `limits` to an empty string ("") when the answer fully covers the question. Do not invent details to fill it.
   - Do not mention BACHI, decoding traces, BLSTM distributions, JSON, schemas, or the internal architecture. The shipping chord model is referred to simply as "the harmony model" when needed.
 Return only valid JSON matching the provided schema. Keep the answer conversational and free of numeric citations.
 """

@@ -140,7 +140,7 @@ def test_explanation_prompt_provides_minimal_response_format() -> None:
     context = build_session_context("explain", _session_state())
     prompt = build_explanation_prompt(context)
 
-    assert prompt.response_schema["required"] == ["answer"]
+    assert prompt.response_schema["required"] == ["answer", "limits"]
     assert "evidence" not in prompt.response_schema["properties"]
     assert "limits" in prompt.response_schema["properties"]
     assert prompt.response_format["type"] == "json_schema"
