@@ -147,7 +147,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # Tab labels
         "tab.melody": "Melody",
         "tab.chords": "Chords",
-        "tab.suggestions": "Suggestions",
+        "tab.lyrics": "Lyrics",
         "tab.explanations": "Explanations",
         # Melody tab
         "melody.subheader": "Melody",
@@ -156,8 +156,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "melody.record": "Record humming",
         "melody.upload": "Or upload an audio file",
         "melody.upload_help": "Accepted formats: WAV, WebM, MP3",
-        "melody.prompt": "Prompt",
-        "melody.tempo_bpm": "Tempo BPM",
+        "melody.source_recording": "Using your recorded humming. Upload a file or clear the recording to switch.",
+        "melody.source_upload": "Using uploaded file: **{name}**. Re-record or clear the upload to switch.",
         "melody.mood_caption": "Mood: **{mood}** (single source of truth — edit in the Story Bible panel above).",
         "melody.extract_button": "Extract Melody",
         "melody.extracted_n": "Extracted {n} note events.",
@@ -290,6 +290,27 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "section.pre_chorus": "pre-chorus",
         "section.chorus": "chorus",
         "section.bridge": "bridge",
+        # Lyrics tab (split out from old Suggestions tab)
+        "lyrics.subheader": "Lyrics",
+        "lyrics.placeholder": "Lyrics tools become available once a session is active.",
+        "lyrics.input_label": "Lyrics",
+        "lyrics.input_placeholder": "Type or paste your lyrics here. They feed both chord generation and lyric suggestions.",
+        "lyrics.input_help": (
+            "Single source of truth for lyrics. Persisted to session state "
+            "when you click Generate; also used by the Chords tab."
+        ),
+        "lyrics.generate_button": "Generate Lyric Suggestions",
+        "lyrics.generated_n": "Generated {n} lyric options.",
+        "lyrics.could_not_generate": "Could not generate lyric suggestions: {err}",
+        "lyrics.no_suggestions": "No lyric suggestions yet.",
+        # Chord tab: lyrics now live in their own tab; preview here
+        "chords.lyrics_preview_header": "**Lyrics (from Lyrics tab)**",
+        "chords.lyrics_empty_hint": "Add lyrics in the **Lyrics** tab to enable chord generation from text.",
+        # Refinement: "lyrics" replaces "suggestions" as the target name
+        "target.lyrics": "lyrics",
+        "refine.button.lyrics": "Refine Lyrics",
+        # Snapshot label for lyric updates committed via the Lyrics tab
+        "snapshot.generated_lyrics": "Generated lyrics ({n} variants)",
     },
     "ru": {
         # App-level chrome
@@ -373,7 +394,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # Tab labels
         "tab.melody": "Мелодия",
         "tab.chords": "Аккорды",
-        "tab.suggestions": "Подсказки",
+        "tab.lyrics": "Тексты",
         "tab.explanations": "Объяснения",
         # Melody tab
         "melody.subheader": "Мелодия",
@@ -382,8 +403,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "melody.record": "Записать напев",
         "melody.upload": "Или загрузите аудиофайл",
         "melody.upload_help": "Поддерживаемые форматы: WAV, WebM, MP3",
-        "melody.prompt": "Подсказка",
-        "melody.tempo_bpm": "Темп (BPM)",
+        "melody.source_recording": "Используется запись напева. Загрузите файл или очистите запись, чтобы переключиться.",
+        "melody.source_upload": "Используется загруженный файл: **{name}**. Перезапишите напев или очистите загрузку, чтобы переключиться.",
         "melody.mood_caption": "Настроение: **{mood}** (единственный источник истины — редактируется в Story Bible выше).",
         "melody.extract_button": "Извлечь мелодию",
         "melody.extracted_n": "Извлечено нот: {n}.",
@@ -516,5 +537,27 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "section.pre_chorus": "предприпев",
         "section.chorus": "припев",
         "section.bridge": "бридж",
+        # Lyrics tab (split out from old Suggestions tab)
+        "lyrics.subheader": "Тексты",
+        "lyrics.placeholder": "Инструменты для текстов появятся после активации сессии.",
+        "lyrics.input_label": "Текст песни",
+        "lyrics.input_placeholder": "Введите или вставьте текст. Он используется и для генерации аккордов, и для подсказок текстов.",
+        "lyrics.input_help": (
+            "Единственный источник истины для текста. Сохраняется в "
+            "сессию при нажатии «Сгенерировать»; также используется во "
+            "вкладке «Аккорды»."
+        ),
+        "lyrics.generate_button": "Сгенерировать варианты текста",
+        "lyrics.generated_n": "Сгенерировано вариантов текста: {n}.",
+        "lyrics.could_not_generate": "Не удалось сгенерировать варианты текста: {err}",
+        "lyrics.no_suggestions": "Вариантов текста пока нет.",
+        # Chord tab: lyrics now live in their own tab; preview here
+        "chords.lyrics_preview_header": "**Текст (из вкладки «Тексты»)**",
+        "chords.lyrics_empty_hint": "Добавьте текст во вкладке **«Тексты»**, чтобы включить генерацию аккордов из текста.",
+        # Refinement
+        "target.lyrics": "тексты",
+        "refine.button.lyrics": "Доработать тексты",
+        # Snapshot label
+        "snapshot.generated_lyrics": "Сгенерированы тексты ({n} вариантов)",
     },
 }

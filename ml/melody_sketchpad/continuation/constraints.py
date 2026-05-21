@@ -17,8 +17,24 @@ from shared.schemas import ChordProgression, MelodyProfile, NoteEvent
 
 _DEFAULT_MAX_SURVIVORS = 5
 _KEY_ADHERENCE_MIN_RATIO = 0.75
-_PITCH_RANGE_SEMITONES = 4
-_DENSITY_TOLERANCE = 0.20
+# Primer-relative boundary: how far the candidate's first note may leap from
+# the primer's last note. Perfect 5th = 7 semitones; cross-phrase leaps
+# wider than this are rare in pop/vocal melodies (BiMMuDa boundary interval
+# mean = 4.4 st, σ = 4.0 — a 5th sits at +0.6σ, an octave at +1.4σ).
+_PRIMER_BOUNDARY_INTERVAL_MAX = 7
+# Primer-relative melodic span: how wide the candidate's own pitch range may
+# be (max − min). 14 semitones = octave + major 2nd, generous ceiling for a
+# single phrase. When the primer itself is wider, scale up so the candidate
+# is allowed to mirror it.
+_PRIMER_SPAN_SEMITONES_MAX = 14
+_PRIMER_SPAN_RELATIVE_MULTIPLIER = 1.5
+# Density tolerance: the maximum relative |candidate − primer| / primer
+# accepted at the constraint gate. Raised from 0.20 on 2026-05-19 once the
+# retimer began firing *before* this check (so the gate sees post-correction
+# density). Candidates that hit the retime clip can still be ~30 % off after
+# partial correction; 0.30 lets those through while still rejecting hopelessly
+# off pacing. Real-world BiMMuDa density σ is much wider than ±20 % anyway.
+_DENSITY_TOLERANCE = 0.30
 _STRONG_BEAT_TOLERANCE = 0.08
 _BEATS_PER_BAR = 4.0
 # z-score cap for conditional-prior checks. Wide on purpose: BiMMuDa stds
@@ -190,9 +206,14 @@ def _evaluate_candidate(
 
     if transition is None:
         # Primer-relative branch: continue stylistically near the primer.
+        # Boundary (continuity) is tight; melodic span (within-phrase contour)
+        # is loose — those are different musical things and the old
+        # `_pitch_range_check` conflated them (rejected interesting contour
+        # because *any* note left a ±4 box around the primer's last pitch).
         return [
             _key_adherence_check(notes, detected_key),
-            _pitch_range_check(notes, primer_last_pitch),
+            _primer_boundary_interval_check(notes, primer_last_pitch),
+            _primer_melodic_span_check(notes, primer_notes),
             _density_check(candidate_profile, primer_profile),
             _chord_consonance_check(notes, chord_symbols),
         ]
@@ -330,18 +351,58 @@ def _key_adherence_check(notes: list[NoteEvent], detected_key: str | None) -> di
     )
 
 
-def _pitch_range_check(notes: list[NoteEvent], primer_last_pitch: int | None) -> dict[str, Any]:
-    if primer_last_pitch is None:
-        return _check("pitch_range", True, 1.0, "")
-    lower = primer_last_pitch - _PITCH_RANGE_SEMITONES
-    upper = primer_last_pitch + _PITCH_RANGE_SEMITONES
-    in_range = [lower <= note.pitch <= upper for note in notes]
-    ratio = sum(in_range) / len(notes)
+def _primer_boundary_interval_check(
+    notes: list[NoteEvent], primer_last_pitch: int | None
+) -> dict[str, Any]:
+    """First-note boundary continuity: the very first candidate note must sit
+    within `_PRIMER_BOUNDARY_INTERVAL_MAX` semitones of the primer's last
+    pitch. Leaps wider than a 5th between phrases are rare in vocal melody
+    and almost always sound disjoint.
+    """
+    if primer_last_pitch is None or not notes:
+        return _check("boundary_interval", True, 1.0, "")
+    candidate_first = int(min(notes, key=lambda note: note.onset).pitch)
+    interval = abs(candidate_first - int(primer_last_pitch))
+    # Graded score that drops linearly: a stepwise entry scores ≈1.0,
+    # an octave leap scores ≈0.17, beyond an octave is clipped to 0.
+    score = max(0.0, 1.0 - interval / 12.0)
     return _check(
-        "pitch_range",
-        all(in_range),
-        ratio,
-        f"pitch range exceeds {lower}-{upper} around primer last pitch {primer_last_pitch}",
+        "boundary_interval",
+        interval <= _PRIMER_BOUNDARY_INTERVAL_MAX,
+        score,
+        (
+            f"boundary interval |{candidate_first} - {primer_last_pitch}| = {interval} st "
+            f"exceeds {_PRIMER_BOUNDARY_INTERVAL_MAX} st (≈ perfect 5th) around primer last pitch"
+        ),
+    )
+
+
+def _primer_melodic_span_check(
+    notes: list[NoteEvent], primer_notes: list[NoteEvent]
+) -> dict[str, Any]:
+    """Within-phrase pitch span: max − min of the candidate's own notes.
+    Capped at `_PRIMER_SPAN_SEMITONES_MAX` (octave + 2nd) so a phrase can
+    explore freely, or `_PRIMER_SPAN_RELATIVE_MULTIPLIER × primer_span`
+    when the primer itself is wider (mirror its contour without flattening
+    it).
+    """
+    if not notes:
+        return _check("melodic_span", True, 1.0, "")
+    candidate_span = _pitch_span(notes)
+    primer_span = _pitch_span(primer_notes) if primer_notes else 0
+    span_limit = max(
+        _PRIMER_SPAN_SEMITONES_MAX,
+        int(round(primer_span * _PRIMER_SPAN_RELATIVE_MULTIPLIER)),
+    )
+    score = max(0.0, 1.0 - candidate_span / (2.0 * span_limit))
+    return _check(
+        "melodic_span",
+        candidate_span <= span_limit,
+        score,
+        (
+            f"melodic span {candidate_span} st exceeds {span_limit} st "
+            f"(cap = max({_PRIMER_SPAN_SEMITONES_MAX}, {_PRIMER_SPAN_RELATIVE_MULTIPLIER:.1f}× primer span {primer_span})"
+        ),
     )
 
 

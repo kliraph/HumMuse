@@ -582,6 +582,11 @@ def accept_melody_continuation(request: Request, payload: MelodyAcceptRequest) -
 def suggest_lyrics(request: Request, payload: SuggestLyricsRequest) -> SuggestLyricsResponse:
     bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="lyrics", use_case="lyric")
     state = _get_session_or_404(str(payload.session_id))
+    # Persist a client-supplied lyrics buffer first so the prompt sees
+    # the latest text. Treat empty/whitespace-only as "no update"; only
+    # an explicit non-empty value overwrites existing state.
+    if payload.lyrics_text is not None and payload.lyrics_text.strip():
+        state.lyrics_text = payload.lyrics_text
     result = generate_lyric_suggestions(
         state,
         mode=payload.mode,

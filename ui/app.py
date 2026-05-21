@@ -113,10 +113,17 @@ def extract_melody_from_audio(
     *,
     session_id: str,
     uploaded_audio: Any,
-    prompt: str,
     mood: str,
-    tempo_bpm: int,
 ) -> dict[str, Any]:
+    """POST audio to the melody-from-hum endpoint.
+
+    ``prompt`` and ``tempo_bpm`` were deliberately removed from the UI:
+    ``prompt`` was a no-op annotation, and ``tempo_bpm`` should be
+    detected from audio (the backend currently falls back to 100 BPM
+    when omitted — a real librosa beat-track is a backend follow-up).
+    The endpoint still accepts both as optional Form fields with
+    defaults, so omitting them here is non-breaking.
+    """
     audio_file = build_audio_file_tuple(uploaded_audio)
     return api_post_multipart(
         api_base_url,
@@ -124,9 +131,7 @@ def extract_melody_from_audio(
         files={"audio": audio_file},
         data={
             "session_id": session_id,
-            "prompt": prompt,
             "mood": mood,
-            "tempo_bpm": str(tempo_bpm),
         },
     )
 
@@ -250,12 +255,22 @@ def request_lyric_suggestions(
     session_id: str,
     mode: str = "continue",
     num_suggestions: int = 3,
+    lyrics_text: str | None = None,
 ) -> dict[str, Any]:
-    return api_post(
-        api_base_url,
-        "/suggest/lyrics",
-        payload={"session_id": session_id, "mode": mode, "num_suggestions": num_suggestions},
-    )
+    """Trigger lyric-suggestion generation.
+
+    ``lyrics_text`` is sent only when non-empty so older backends that
+    ignore unknown fields stay happy and we don't accidentally wipe
+    session state with an empty buffer from a stale text area.
+    """
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "mode": mode,
+        "num_suggestions": num_suggestions,
+    }
+    if lyrics_text and lyrics_text.strip():
+        payload["lyrics_text"] = lyrics_text
+    return api_post(api_base_url, "/suggest/lyrics", payload=payload)
 
 
 def refine_session(
@@ -428,13 +443,11 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("active_session_id", None)
     st.session_state.setdefault("active_session_state", None)
     st.session_state.setdefault("selected_session_label", None)
-    st.session_state.setdefault("melody_prompt", "Melody sketch from humming")
-    st.session_state.setdefault("melody_mood", "uplift")
-    st.session_state.setdefault("melody_tempo", 120)
     st.session_state.setdefault("lyrics_input", "")
+    st.session_state.setdefault("audio_source", None)
     st.session_state.setdefault("melody_refine_text", "")
     st.session_state.setdefault("chords_refine_text", "")
-    st.session_state.setdefault("suggestions_refine_text", "")
+    st.session_state.setdefault("lyrics_refine_text", "")
     st.session_state.setdefault("explanations_chat_text", "")
     st.session_state.setdefault("melody_playback_audio", None)
     st.session_state.setdefault("melody_playback_source", None)
@@ -830,22 +843,57 @@ def render_melody_tab() -> None:
         return
 
     st.write(t("melody.upload_label"))
-    recorded_audio = st.audio_input(t("melody.record"))
+    # Track which input was touched most recently. `on_change` fires for
+    # both "value set" and "value cleared", so the simple latest-wins
+    # rule below also handles users clearing one input to fall back to
+    # the other. Default precedence (no interaction yet) is recording
+    # over upload, matching the historical behaviour for fresh sessions.
+    def _mark_recording_source() -> None:
+        st.session_state.audio_source = "recording"
+
+    def _mark_upload_source() -> None:
+        st.session_state.audio_source = "upload"
+
+    recorded_audio = st.audio_input(
+        t("melody.record"),
+        key="hum_recording",
+        on_change=_mark_recording_source,
+    )
     uploaded_audio = st.file_uploader(
         t("melody.upload"),
         type=SUPPORTED_AUDIO_TYPES,
         accept_multiple_files=False,
         help=t("melody.upload_help"),
+        key="hum_upload",
+        on_change=_mark_upload_source,
     )
 
-    chosen_audio = recorded_audio or uploaded_audio
+    # Resolve the active source: respect the user's most recent action,
+    # but if that source got cleared, fall back to the other one rather
+    # than blocking the Extract button.
+    active_source = st.session_state.get("audio_source")
+    if active_source == "upload":
+        chosen_audio = uploaded_audio or recorded_audio
+    elif active_source == "recording":
+        chosen_audio = recorded_audio or uploaded_audio
+    else:
+        chosen_audio = recorded_audio or uploaded_audio
+
     if chosen_audio is not None:
         _, audio_bytes, mime_type = build_audio_file_tuple(chosen_audio)
         st.audio(audio_bytes, format=mime_type)
+        # Surface which source we'll actually extract from — otherwise
+        # users with both inputs filled can't tell which one wins.
+        if chosen_audio is uploaded_audio:
+            st.caption(
+                t(
+                    "melody.source_upload",
+                    name=getattr(uploaded_audio, "name", "audio"),
+                )
+            )
+        else:
+            st.caption(t("melody.source_recording"))
 
-    controls_a, controls_b = st.columns(2)
-    controls_a.text_input(t("melody.prompt"), key="melody_prompt")
-    controls_b.number_input(t("melody.tempo_bpm"), min_value=40, max_value=240, key="melody_tempo")
     current_mood = st.session_state.story_bible["mood"]
     st.caption(t("melody.mood_caption", mood=t(f"mood.{current_mood}")))
 
@@ -855,9 +903,7 @@ def render_melody_tab() -> None:
                 DEFAULT_API_URL,
                 session_id=state["session_id"],
                 uploaded_audio=chosen_audio,
-                prompt=st.session_state.melody_prompt,
                 mood=st.session_state.story_bible["mood"],
-                tempo_bpm=int(st.session_state.melody_tempo),
             )
             st.session_state.latest_melody_result = response
             try:
@@ -943,7 +989,112 @@ def render_melody_tab() -> None:
                 t("melody.playback_source", source=st.session_state.melody_playback_source)
             )
 
+    render_melody_continuation_section(state)
     render_refinement_panel("melody")
+
+
+def render_melody_continuation_section(state: dict[str, Any]) -> None:
+    """Melody-continuation generator + variant cards.
+
+    Moved out of the old Suggestions tab and into the Melody tab so the
+    "extract → continue" workflow lives in one place. The section labels
+    (verse / chorus / etc.) stay English values because the backend
+    keys on them; only the display goes through ``t()``.
+    """
+    st.divider()
+    st.markdown(t("suggestions.melody_header"))
+    section_options = ["Any", "verse", "pre_chorus", "chorus", "bridge"]
+    section_cols = st.columns(2)
+    with section_cols[0]:
+        primer_section_choice = st.selectbox(
+            t("suggestions.primer_label"),
+            section_options,
+            index=0,
+            key=f"primer_section_{state['session_id']}",
+            format_func=lambda s: t(f"section.{s}"),
+            help=t("suggestions.primer_help"),
+        )
+    with section_cols[1]:
+        target_section_choice = st.selectbox(
+            t("suggestions.target_label"),
+            section_options,
+            index=0,
+            key=f"target_section_{state['session_id']}",
+            format_func=lambda s: t(f"section.{s}"),
+            help=t("suggestions.target_help"),
+        )
+    primer_section = None if primer_section_choice == "Any" else primer_section_choice
+    target_section = None if target_section_choice == "Any" else target_section_choice
+    if st.button(
+        t("suggestions.generate_melody"),
+        use_container_width=True,
+        key="generate_melody_continuations",
+    ):
+        try:
+            response = request_melody_suggestions(
+                DEFAULT_API_URL,
+                session_id=state["session_id"],
+                primer_section=primer_section,
+                target_section=target_section,
+            )
+            st.session_state.active_session_state = fetch_session_state(
+                DEFAULT_API_URL,
+                state["session_id"],
+            )
+            state = st.session_state.active_session_state
+            st.success(t("suggestions.generated_melody_n", n=len(response["melody_suggestions"])))
+        except requests.RequestException as exc:
+            st.error(t("suggestions.could_not_generate_melody", err=exc))
+
+    melody_suggestions = state.get("melody_suggestions", [])
+    if melody_suggestions:
+
+        def render_melody_card(index: int, suggestion: dict[str, Any]) -> None:
+            with st.container(border=True):
+                st.markdown(t("chords.variant_label", n=index + 1))
+                engine = suggestion.get("engine", "mock")
+                coherence = float(suggestion["coherence_score"])
+                avg_log_prob = suggestion.get("avg_log_prob")
+                metric_cols = st.columns(2)
+                metric_cols[0].metric(t("suggestions.coherence"), f"{coherence:.2f}")
+                if avg_log_prob is not None:
+                    metric_cols[1].metric(t("suggestions.avg_log_p"), f"{float(avg_log_prob):.2f}")
+                else:
+                    metric_cols[1].metric(t("suggestions.engine"), engine)
+                st.caption(suggestion["explanation"])
+                if suggestion.get("notes"):
+                    try:
+                        st.audio(
+                            synthesize_wave_from_notes(suggestion["notes"]),
+                            format="audio/wav",
+                        )
+                    except Exception:
+                        st.caption(t("suggestions.preview_unavailable"))
+                if st.button(
+                    t("suggestions.use_continuation"),
+                    key=f"accept_melody_suggestion_{index + 1}",
+                    use_container_width=True,
+                ):
+                    try:
+                        response = accept_melody_suggestion(
+                            DEFAULT_API_URL,
+                            session_id=state["session_id"],
+                            suggestion_index=index,
+                        )
+                        st.session_state.active_session_state = response["state"]
+                        push_snapshot("snapshot.accepted_continuation", n=index + 1)
+                        st.success(t("suggestions.melody_extended"))
+                        st.rerun()
+                    except requests.RequestException as exc:
+                        st.error(t("suggestions.could_not_apply", err=exc))
+
+        render_grid(
+            melody_suggestions,
+            cols_per_row=3,
+            render_card=render_melody_card,
+        )
+    else:
+        st.caption(t("suggestions.no_continuations"))
 
 
 def render_chords_tab() -> None:
@@ -954,21 +1105,24 @@ def render_chords_tab() -> None:
         return
 
     st.markdown(t("chords.generate_from_lyrics_header"))
-    lyrics_default = state.get("lyrics_text") or st.session_state.lyrics_input
-    lyrics_text = st.text_area(
-        t("chords.lyrics_label"),
-        value=lyrics_default,
-        key="lyrics_input",
-        height=160,
-        placeholder=t("chords.lyrics_placeholder"),
-    )
+    # Lyrics input now lives in the Lyrics tab — single source of truth.
+    # Here we just show what the active session holds and gate chord
+    # generation on its presence. Empty state = clear pointer to the
+    # Lyrics tab rather than a stub-looking disabled text box.
+    lyrics_in_state = (state.get("lyrics_text") or "").strip()
+    if lyrics_in_state:
+        st.markdown(t("chords.lyrics_preview_header"))
+        with st.container(border=True):
+            st.write(lyrics_in_state)
+    else:
+        st.info(t("chords.lyrics_empty_hint"))
 
-    if st.button(t("chords.generate_button"), use_container_width=True, disabled=not lyrics_text.strip()):
+    if st.button(t("chords.generate_button"), use_container_width=True, disabled=not lyrics_in_state):
         try:
             response = generate_chords_from_lyrics(
                 DEFAULT_API_URL,
                 session_id=state["session_id"],
-                lyrics_text=lyrics_text.strip(),
+                lyrics_text=lyrics_in_state,
             )
             st.session_state.active_session_state = fetch_session_state(
                 DEFAULT_API_URL,
@@ -1070,151 +1224,80 @@ def render_chords_tab() -> None:
     render_refinement_panel("chords")
 
 
-def render_suggestions_tab() -> None:
+def render_lyrics_tab() -> None:
+    """Lyrics tab: typed lyrics buffer + lyric suggestion generator.
+
+    Owns the lyrics text-input that the Chords tab and the GPT lyric
+    prompts both consume. Clicking Generate POSTs the buffer to
+    ``/suggest/lyrics`` (which persists ``state.lyrics_text`` before
+    generating), then renders the returned variants as a grid.
+    """
     state = st.session_state.active_session_state
-    st.subheader(t("suggestions.subheader"))
+    st.subheader(t("lyrics.subheader"))
     if not state:
-        st.write(t("suggestions.placeholder"))
+        st.write(t("lyrics.placeholder"))
         return
 
-    melody_column, lyric_column = st.columns(2)
+    # Pre-populate from session state on first render of a session; the
+    # widget's `key` keeps the user's edits sticky across reruns.
+    existing_lyrics = state.get("lyrics_text") or ""
+    lyrics_text = st.text_area(
+        t("lyrics.input_label"),
+        value=existing_lyrics if not st.session_state.lyrics_input else None,
+        key="lyrics_input",
+        height=200,
+        placeholder=t("lyrics.input_placeholder"),
+        help=t("lyrics.input_help"),
+    )
 
-    with melody_column:
-        st.markdown(t("suggestions.melody_header"))
-        # Song-form section labels. Both default to "Any" (=> no label sent
-        # => backend uses primer-relative constraints). Values stay
-        # English ("verse", "pre_chorus" …) because the backend keys on
-        # them; only the display label is translated via format_func.
-        section_options = ["Any", "verse", "pre_chorus", "chorus", "bridge"]
-        section_cols = st.columns(2)
-        with section_cols[0]:
-            primer_section_choice = st.selectbox(
-                t("suggestions.primer_label"),
-                section_options,
-                index=0,
-                key=f"primer_section_{state['session_id']}",
-                format_func=lambda s: t(f"section.{s}"),
-                help=t("suggestions.primer_help"),
+    if st.button(
+        t("lyrics.generate_button"),
+        use_container_width=True,
+        key="generate_lyric_suggestions",
+    ):
+        try:
+            response = request_lyric_suggestions(
+                DEFAULT_API_URL,
+                session_id=state["session_id"],
+                lyrics_text=lyrics_text,
             )
-        with section_cols[1]:
-            target_section_choice = st.selectbox(
-                t("suggestions.target_label"),
-                section_options,
-                index=0,
-                key=f"target_section_{state['session_id']}",
-                format_func=lambda s: t(f"section.{s}"),
-                help=t("suggestions.target_help"),
+            st.session_state.active_session_state = fetch_session_state(
+                DEFAULT_API_URL,
+                state["session_id"],
             )
-        primer_section = None if primer_section_choice == "Any" else primer_section_choice
-        target_section = None if target_section_choice == "Any" else target_section_choice
-        if st.button(t("suggestions.generate_melody"), use_container_width=True):
-            try:
-                response = request_melody_suggestions(
-                    DEFAULT_API_URL,
-                    session_id=state["session_id"],
-                    primer_section=primer_section,
-                    target_section=target_section,
-                )
-                st.session_state.active_session_state = fetch_session_state(
-                    DEFAULT_API_URL,
-                    state["session_id"],
-                )
-                state = st.session_state.active_session_state
-                st.success(t("suggestions.generated_melody_n", n=len(response["melody_suggestions"])))
-            except requests.RequestException as exc:
-                st.error(t("suggestions.could_not_generate_melody", err=exc))
-
-        melody_suggestions = state.get("melody_suggestions", [])
-        if melody_suggestions:
-
-            def render_melody_card(index: int, suggestion: dict[str, Any]) -> None:
-                with st.container(border=True):
-                    st.markdown(t("chords.variant_label", n=index + 1))
-                    engine = suggestion.get("engine", "mock")
-                    coherence = float(suggestion["coherence_score"])
-                    avg_log_prob = suggestion.get("avg_log_prob")
-                    metric_cols = st.columns(2)
-                    metric_cols[0].metric(t("suggestions.coherence"), f"{coherence:.2f}")
-                    if avg_log_prob is not None:
-                        metric_cols[1].metric(t("suggestions.avg_log_p"), f"{float(avg_log_prob):.2f}")
-                    else:
-                        metric_cols[1].metric(t("suggestions.engine"), engine)
-                    st.caption(suggestion["explanation"])
-                    if suggestion.get("notes"):
-                        try:
-                            st.audio(
-                                synthesize_wave_from_notes(suggestion["notes"]),
-                                format="audio/wav",
-                            )
-                        except Exception:
-                            st.caption(t("suggestions.preview_unavailable"))
-                    if st.button(
-                        t("suggestions.use_continuation"),
-                        key=f"accept_melody_suggestion_{index + 1}",
-                        use_container_width=True,
-                    ):
-                        try:
-                            response = accept_melody_suggestion(
-                                DEFAULT_API_URL,
-                                session_id=state["session_id"],
-                                suggestion_index=index,
-                            )
-                            st.session_state.active_session_state = response["state"]
-                            push_snapshot("snapshot.accepted_continuation", n=index + 1)
-                            st.success(t("suggestions.melody_extended"))
-                            st.rerun()
-                        except requests.RequestException as exc:
-                            st.error(t("suggestions.could_not_apply", err=exc))
-
-            render_grid(
-                melody_suggestions,
-                cols_per_row=3,
-                render_card=render_melody_card,
+            state = st.session_state.active_session_state
+            push_snapshot(
+                "snapshot.generated_lyrics",
+                n=len(response["lyric_suggestions"]),
             )
-        else:
-            st.caption(t("suggestions.no_continuations"))
+            st.success(t("lyrics.generated_n", n=len(response["lyric_suggestions"])))
+        except requests.RequestException as exc:
+            st.error(t("lyrics.could_not_generate", err=exc))
 
-    with lyric_column:
-        st.markdown(t("suggestions.lyric_header"))
-        if st.button(t("suggestions.generate_lyrics"), use_container_width=True):
-            try:
-                response = request_lyric_suggestions(
-                    DEFAULT_API_URL,
-                    session_id=state["session_id"],
-                )
-                st.session_state.active_session_state = fetch_session_state(
-                    DEFAULT_API_URL,
-                    state["session_id"],
-                )
-                state = st.session_state.active_session_state
-                st.success(t("suggestions.generated_lyrics_n", n=len(response["lyric_suggestions"])))
-            except requests.RequestException as exc:
-                st.error(t("suggestions.could_not_generate_lyrics", err=exc))
+    lyric_suggestions = state.get("lyric_suggestions", [])
+    if lyric_suggestions:
 
-        lyric_suggestions = state.get("lyric_suggestions", [])
-        if lyric_suggestions:
-
-            def render_lyric_card(index: int, suggestion: dict[str, Any]) -> None:
-                with st.container(border=True):
-                    st.markdown(t("chords.variant_label", n=index + 1))
-                    st.write(suggestion["text"])
-                    st.caption(
-                        t(
-                            "suggestions.lyric_caption",
-                            mode=suggestion["mode"],
-                            syllables=suggestion["syllable_count"],
-                        )
+        def render_lyric_card(index: int, suggestion: dict[str, Any]) -> None:
+            with st.container(border=True):
+                st.markdown(t("chords.variant_label", n=index + 1))
+                st.write(suggestion["text"])
+                st.caption(
+                    t(
+                        "suggestions.lyric_caption",
+                        mode=suggestion["mode"],
+                        syllables=suggestion["syllable_count"],
                     )
+                )
 
-            render_grid(
-                lyric_suggestions,
-                cols_per_row=3,
-                render_card=render_lyric_card,
-            )
-        else:
-            st.caption(t("suggestions.no_lyrics"))
+        render_grid(
+            lyric_suggestions,
+            cols_per_row=3,
+            render_card=render_lyric_card,
+        )
+    else:
+        st.caption(t("lyrics.no_suggestions"))
 
-    render_refinement_panel("suggestions")
+    render_refinement_panel("lyrics")
 
 
 def render_explanations_tab() -> None:
@@ -1328,15 +1411,15 @@ def main() -> None:
 
     render_session_overview()
     render_story_bible()
-    melody_tab, chords_tab, suggestions_tab, explanations_tab = st.tabs(
-        [t("tab.melody"), t("tab.chords"), t("tab.suggestions"), t("tab.explanations")]
+    melody_tab, chords_tab, lyrics_tab, explanations_tab = st.tabs(
+        [t("tab.melody"), t("tab.chords"), t("tab.lyrics"), t("tab.explanations")]
     )
     with melody_tab:
         render_melody_tab()
     with chords_tab:
         render_chords_tab()
-    with suggestions_tab:
-        render_suggestions_tab()
+    with lyrics_tab:
+        render_lyrics_tab()
     with explanations_tab:
         render_explanations_tab()
 

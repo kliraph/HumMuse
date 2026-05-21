@@ -95,6 +95,12 @@ class SuggestLyricsRequest(BaseModel):
     session_id: UUID
     mode: str = Field(default="continue", min_length=1)
     num_suggestions: int = Field(default=3, ge=1, le=5)
+    # Optional: if the client carries a typed lyrics buffer (e.g. the
+    # Lyrics tab text area), persist it to session state before
+    # generating so the GPT prompt sees the latest text. Backward-
+    # compatible — older clients omit this and the endpoint reads
+    # whatever already lives on the session.
+    lyrics_text: str | None = None
 
 
 class SuggestLyricsResponse(BaseModel):

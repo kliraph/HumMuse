@@ -156,7 +156,7 @@ def reduce_noise(
         reduced = nr.reduce_noise(
             y=waveform.astype(np.float64),
             sr=sample_rate,
-            stationary=True,
+            stationary=False,
             prop_decrease=prop_decrease,
         )
     except Exception:

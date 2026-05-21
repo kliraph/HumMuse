@@ -2,13 +2,13 @@
   "continuation": {
     "engine": "ensemble",
     "device": "cpu",
-    "top_k": 40,
+    "top_k": 50,
     "single": {
       "checkpoint": "storage/models/Lakh-MT/best_seed1337.pt",
       "tokenizer": "storage/models/Lakh-MT/tokenizer.json",
       "model_id": "single",
-      "count": 8,
-      "temperatures": [0.5, 0.7, 0.9]
+      "count": 9,
+      "temperatures":  [0.7, 0.9, 1.1]
     },
     "ensemble": {
       "members": [
@@ -16,22 +16,22 @@
           "checkpoint": "storage/models/Lakh-MT/best_seed7.pt",
           "tokenizer": "storage/models/Lakh-MT/tokenizer.json",
           "model_id": "seed7",
-          "temperatures": [0.5, 0.7, 0.9],
+          "temperatures":  [0.7, 0.9, 1.1],
           "count": 3
         },
         {
           "checkpoint": "storage/models/Lakh-MT/best_seed42.pt",
           "tokenizer": "storage/models/Lakh-MT/tokenizer.json",
           "model_id": "seed42",
-          "temperatures": [0.5, 0.7, 0.9],
+          "temperatures":  [0.7, 0.9, 1.1],
           "count": 3
         },
         {
           "checkpoint": "storage/models/Lakh-MT/best_seed1337.pt",
           "tokenizer": "storage/models/Lakh-MT/tokenizer.json",
           "model_id": "seed1337",
-          "temperatures": [0.7, 0.9],
-          "count": 2
+          "temperatures":  [0.7, 0.9, 1.1],
+          "count": 3
         }
       ]
     }

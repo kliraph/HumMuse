@@ -20,7 +20,6 @@ from ml.melody_sketchpad.preprocess import (
     preprocess_audio,
 )
 from ml.melody_sketchpad.profile import build_melody_profile
-from ml.melody_sketchpad.quantize import quantize_notes
 from ml.melody_sketchpad.smooth import smooth_notes
 from shared.schemas import ChordSuggestion, ExplanationPart, MelodyNote, MelodyProfile, NoteEvent
 
@@ -46,10 +45,19 @@ def run_melody_pipeline(
     tempo_bpm: int | None = None,
     mood: str | None = None,
 ) -> MelodyResult:
-    """Execute the melody pipeline from audio bytes to a structured result."""
+    """Execute the melody pipeline from audio bytes to a structured result.
+
+    Tempo resolution policy (recorded in ``metadata['tempo_source']``):
+      - ``user_provided``: caller passed a value → it wins, no detection.
+      - ``fallback_silent_audio``: decode fell back to a silent proxy
+        (invalid/unreadable upload) → 100 BPM, can't detect from silence.
+      - ``librosa_beat_track``: librosa estimated tempo from the
+        preprocessed audio.
+      - ``fallback_detection_failed``: librosa raised or returned a
+        non-finite value → 100 BPM safety net.
+    """
     timings: dict[str, float] = {}
     metadata: dict[str, Any] = {}
-    tempo = float(tempo_bpm or 100)
 
     decode_started = time.perf_counter()
     audio, used_audio_fallback, decode_error = _load_audio_with_fallback(audio_bytes)
@@ -62,24 +70,48 @@ def run_melody_pipeline(
     processed_audio = preprocess_audio(audio, DEFAULT_SAMPLE_RATE)
     timings["preprocess_audio"] = _elapsed_ms(preprocess_started)
 
+    tempo_started = time.perf_counter()
+    if tempo_bpm is not None:
+        # Manual override — caller knows the tempo (or wants to force it
+        # for reproducibility in tests/golden runs). Skip detection.
+        tempo = float(tempo_bpm)
+        metadata["tempo_source"] = "user_provided"
+    elif used_audio_fallback:
+        # Detecting tempo from a silent placeholder would be noise.
+        tempo = 100.0
+        metadata["tempo_source"] = "fallback_silent_audio"
+    else:
+        tempo, detection_succeeded = _detect_tempo(processed_audio, DEFAULT_SAMPLE_RATE)
+        metadata["tempo_source"] = (
+            "librosa_beat_track" if detection_succeeded else "fallback_detection_failed"
+        )
+    metadata["tempo_bpm"] = round(tempo, 2)
+    timings["detect_tempo"] = _elapsed_ms(tempo_started)
+    # Downstream stages expect an int tempo hint; pass the resolved
+    # value so quantization and MIDI export agree with detected_tempo.
+    resolved_tempo_int = int(round(tempo))
+
     notes_started = time.perf_counter()
     melody, extraction_meta = _extract_melody_notes(
         processed_audio,
         DEFAULT_SAMPLE_RATE,
         audio_bytes=audio_bytes,
-        tempo_bpm=tempo_bpm,
+        tempo_bpm=resolved_tempo_int,
         mood=mood,
         used_audio_fallback=used_audio_fallback,
     )
     timings["generate_notes"] = _elapsed_ms(notes_started)
     metadata.update(extraction_meta)
 
-    quantize_started = time.perf_counter()
-    quantized = quantize_notes(melody)
-    timings["quantize_notes"] = _elapsed_ms(quantize_started)
+    # Quantization is intentionally NOT applied here. PESTO produces 10 ms-
+    # resolution onsets that respect the natural rubato of humming; snapping
+    # to an 1/8 grid at typical hum tempos (60-140 BPM) crushes distinct
+    # onsets into the same cell and produces phantom polyphony at MIDI export.
+    # Quantization stays available as a user-facing post-step via
+    # ml.melody_sketchpad.quantize.quantize_notes if a snapped grid is wanted.
 
     smooth_started = time.perf_counter()
-    smoothed = smooth_notes(quantized)
+    smoothed = smooth_notes(melody)
     timings["smooth_notes"] = _elapsed_ms(smooth_started)
 
     events_started = time.perf_counter()
@@ -92,7 +124,7 @@ def run_melody_pipeline(
     timings["detect_key"] = _elapsed_ms(key_started)
 
     midi_started = time.perf_counter()
-    midi_bytes = notes_to_midi(smoothed, tempo_bpm=int(tempo))
+    midi_bytes = notes_to_midi(smoothed, tempo_bpm=resolved_tempo_int)
     timings["export_midi"] = _elapsed_ms(midi_started)
 
     explain_started = time.perf_counter()
@@ -126,6 +158,34 @@ def _load_audio_with_fallback(audio_bytes: bytes) -> tuple[Any, bool, str | None
     except (EOFError, TypeError, ValueError, sf.LibsndfileError) as exc:
         fallback = _silent_audio_from_size(audio_size(audio_bytes))
         return fallback, True, str(exc)
+
+
+def _detect_tempo(audio: Any, sample_rate: int) -> tuple[float, bool]:
+    """Estimate tempo from preprocessed audio via librosa beat tracking.
+
+    Returns ``(tempo_bpm, succeeded)``. On any failure — librosa import
+    error, internal raise, non-finite/non-positive result, empty audio —
+    returns ``(100.0, False)`` so callers always have a usable scalar.
+    The boolean lets the pipeline record whether the value came from
+    real detection or the safety net (see ``metadata['tempo_source']``).
+
+    100 BPM matches the historical hardcoded default the pipeline used
+    before detection existed, so failure modes don't change behaviour
+    versus pre-detection runs.
+    """
+    import numpy as np
+
+    try:
+        import librosa
+
+        tempo_array, _ = librosa.beat.beat_track(y=audio, sr=sample_rate)
+        tempo_value = float(np.atleast_1d(tempo_array)[0])
+    except Exception:
+        return 100.0, False
+
+    if not np.isfinite(tempo_value) or tempo_value <= 0:
+        return 100.0, False
+    return tempo_value, True
 
 
 class NoMelodyDetectedError(ValueError):

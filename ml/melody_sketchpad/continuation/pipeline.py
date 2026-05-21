@@ -15,7 +15,7 @@ try:
 except ImportError:  # pragma: no cover - optional local convenience
     load_dotenv = None
 
-from ml.melody_sketchpad.continuation.constraints import filter_candidates
+from ml.melody_sketchpad.continuation.constraints import decode_candidate_midi, filter_candidates
 from ml.melody_sketchpad.continuation.emotion_temperature import (
     generate_ensemble_with_emotion_temperature,
 )
@@ -24,9 +24,11 @@ from ml.melody_sketchpad.continuation.inference import (
     EnsembleMelodyContinuationModel,
 )
 from ml.melody_sketchpad.continuation.primer import notes_to_prompt_midi
+from ml.melody_sketchpad.continuation.priors import load_transition_profile
+from ml.melody_sketchpad.continuation.retime import retime_to_primer_density
 from ml.melody_sketchpad.continuation.scoring import score_candidates
 from ml.melody_sketchpad.profile import build_melody_profile
-from shared.schemas import MelodySuggestion, SessionState
+from shared.schemas import MelodySuggestion, NoteEvent, SessionState
 
 LOGGER = logging.getLogger(__name__)
 
@@ -68,8 +70,8 @@ _DEFAULT_CONTINUATION_CONFIG: dict[str, Any] = {
                     "checkpoint": "storage/models/Lakh-MT/best_seed1337.pt",
                     "tokenizer": "storage/models/Lakh-MT/tokenizer.json",
                     "model_id": "seed1337",
-                    "temperatures": [0.7, 0.9],
-                    "count": 2,
+                    "temperatures": [0.5, 0.7, 0.9],
+                    "count": 3,
                 },
             ]
         },
@@ -84,13 +86,20 @@ def continue_melody(
     max_new_tokens: int = _DEFAULT_MAX_NEW_TOKENS,
     top_n: int = _DEFAULT_TOP_N,
     out_dir: Path | str | None = None,
+    retime_to_primer: bool = True,
 ) -> list[MelodySuggestion]:
     """
     Continue the active session melody with Music Transformer candidates.
 
-    Flow: primer adapter -> generation -> constraints -> profile scoring -> top N
-    `MelodySuggestion`s. The function mutates `session_state.user_params` with
-    constraint traces useful for later run logging.
+    Flow: primer adapter -> generation -> constraints -> profile scoring ->
+    *active-phrase retime* -> top N `MelodySuggestion`s. The function mutates
+    `session_state.user_params` with constraint traces useful for later run
+    logging.
+
+    `retime_to_primer=True` (default) runs each surviving candidate through
+    ``retime_to_primer_density`` — a gentle onset stretch toward the
+    primer's active-phrase density (clipped to [0.7, 1.4]). Set to False to
+    keep the raw Music Transformer timing.
     """
     if not session_state.melody_notes:
         raise ValueError("session_state.melody_notes is required for continuation")
@@ -122,6 +131,19 @@ def continue_melody(
             out_dir=work_dir,
         )
         _log_pool_regime_warning(candidates)
+
+        # Retime BEFORE filtering. The density gate inside filter_candidates
+        # would otherwise reject candidates whose only problem is pacing —
+        # which is exactly what retiming was designed to fix. Doing it first
+        # gives the gate the corrected timing to evaluate against.
+        retime_telemetry: list[dict[str, Any]] = []
+        if retime_to_primer and candidates:
+            retime_telemetry = _retime_all_candidates(
+                candidates,
+                primer_notes=session_state.melody_notes,
+                primer_bpm=float(session_state.detected_tempo or 120.0),
+            )
+
         filtered = filter_candidates(
             candidates,
             primer_notes=session_state.melody_notes,
@@ -132,16 +154,36 @@ def continue_melody(
             primer_section=session_state.primer_section,
             target_section=session_state.target_section,
         )
-        scored = score_candidates(filtered.survivors, primer_profile)
+        # Resolve the transition once more for the scoring stage. LRU-cached
+        # in priors.py so the duplicate lookup is free. Passing the resolved
+        # transition (vs. section labels) keeps score_candidates ignorant of
+        # the JSON file layout.
+        scoring_transition = load_transition_profile(
+            session_state.primer_section,
+            session_state.target_section,
+        )
+        scored = score_candidates(
+            filtered.survivors,
+            primer_profile,
+            primer_notes=session_state.melody_notes,
+            transition=scoring_transition,
+        )
+        top = scored[:top_n]
+
         suggestions = [
             _candidate_to_suggestion(candidate)
-            for candidate in scored[:top_n]
+            for candidate in top
         ]
 
         session_state.user_params["continuation_constraint_trace"] = filtered.trace
         session_state.user_params["continuation_rejection_metadata"] = filtered.rejection_metadata
         session_state.user_params["continuation_candidate_count"] = len(candidates)
         session_state.user_params["continuation_survivor_count"] = len(filtered.survivors)
+        if retime_to_primer:
+            session_state.user_params["continuation_retime_trace"] = retime_telemetry
+            session_state.user_params["continuation_retime_clipped_count"] = sum(
+                1 for r in retime_telemetry if r.get("was_clipped")
+            )
         return suggestions
     finally:
         if temp_context is not None:
@@ -220,10 +262,127 @@ def _generate_candidates(
     )
 
 
+def _retime_all_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    primer_notes: list[NoteEvent],
+    primer_bpm: float,
+) -> list[dict[str, Any]]:
+    """Apply the active-phrase / tight-clip retimer to every candidate
+    *before* the constraint filter runs.
+
+    For each candidate this:
+      - decodes the MIDI at ``candidate["midi_path"]`` to get its notes
+      - calls ``retime_to_primer_density`` against the primer's active phrase
+      - rewrites the MIDI on disk if the stretch factor isn't ~1.0 (so the
+        downstream constraint filter — which re-decodes from disk — sees the
+        retimed timing, and so does the rendered audio)
+      - stashes the retime result on the candidate dict so
+        ``_candidate_to_suggestion`` can surface it via ``score_breakdown``
+
+    Per-candidate failures (bad MIDI, decode errors) are swallowed and the
+    candidate is left untouched; the constraint filter will handle it.
+    """
+    telemetry: list[dict[str, Any]] = []
+    for idx, candidate in enumerate(candidates):
+        midi_path_str = candidate.get("midi_path")
+        if not midi_path_str:
+            continue
+        midi_path = Path(midi_path_str)
+        try:
+            candidate_bpm = _read_midi_tempo(midi_path)
+            cand_notes = decode_candidate_midi(midi_path)
+        except Exception as exc:
+            LOGGER.info(
+                "retime_decode_failed",
+                extra={"candidate_idx": idx, "midi_path": str(midi_path), "error": str(exc)},
+            )
+            continue
+
+        result = retime_to_primer_density(
+            cand_notes,
+            primer_notes,
+            candidate_bpm=candidate_bpm,
+            primer_bpm=primer_bpm,
+        )
+        if abs(result.stretch_factor - 1.0) > 1e-6:
+            try:
+                _rewrite_midi_at(midi_path, result.notes)
+            except Exception as exc:
+                LOGGER.info(
+                    "retime_midi_rewrite_failed",
+                    extra={"candidate_idx": idx, "midi_path": str(midi_path), "error": str(exc)},
+                )
+                continue
+
+        candidate["retime"] = {
+            "stretch_factor": float(result.stretch_factor),
+            "raw_stretch_factor": float(result.raw_stretch_factor),
+            "was_clipped": bool(result.was_clipped),
+            "primer_density": float(result.primer_active_density),
+            "density_before": float(result.candidate_density_before),
+            "density_after": float(result.candidate_density_after),
+        }
+        telemetry.append({
+            "candidate_idx": idx,
+            "model_id": candidate.get("model_id"),
+            **candidate["retime"],
+        })
+    return telemetry
+
+
+def _read_midi_tempo(midi_path: Path) -> float:
+    """Read the first tempo from a MIDI file; fall back to 120 BPM."""
+    from symusic import Score
+
+    try:
+        score = Score(str(midi_path))
+        if score.tempos:
+            return float(score.tempos[0].qpm)
+    except Exception:
+        pass
+    return 120.0
+
+
+def _rewrite_midi_at(midi_path: Path, retimed_notes_beats: list[NoteEvent]) -> None:
+    """Replace the on-disk MIDI's notes with retimed ones, preserving tempo + TPQ."""
+    from symusic import Note, Score, Track
+
+    try:
+        score = Score(str(midi_path))
+        tpq = int(getattr(score, "ticks_per_quarter", getattr(score, "tpq", 480)) or 480)
+    except Exception:
+        score = Score(480)
+        tpq = 480
+
+    # Drop all existing tracks; rebuild a single melody track in their place.
+    score.tracks.clear()
+    track = Track(name="retimed", program=0, is_drum=False)
+    for n in retimed_notes_beats:
+        track.notes.append(Note(
+            int(round(float(n.onset) * tpq)),
+            max(1, int(round(float(n.duration) * tpq))),
+            int(n.pitch),
+            int(n.velocity),
+        ))
+    score.tracks.append(track)
+    score.dump_midi(str(midi_path))
+
+
 def _candidate_to_suggestion(candidate: dict[str, Any]) -> MelodySuggestion:
     midi_path = Path(candidate["midi_path"])
     constraint_text = candidate.get("constraint_explanation", "")
     score_breakdown = dict(candidate.get("score_breakdown", {}))
+    retime_info = candidate.get("retime")
+    if retime_info:
+        score_breakdown.update({
+            "retime_stretch_factor": float(retime_info.get("stretch_factor", 1.0)),
+            "retime_raw_stretch_factor": float(retime_info.get("raw_stretch_factor", 1.0)),
+            "retime_clipped": bool(retime_info.get("was_clipped", False)),
+            "retime_primer_density": float(retime_info.get("primer_density", 0.0)),
+            "retime_density_before": float(retime_info.get("density_before", 0.0)),
+            "retime_density_after": float(retime_info.get("density_after", 0.0)),
+        })
     model_id = candidate.get("model_id", "single")
     temperature = candidate.get("temperature")
     explanation = (

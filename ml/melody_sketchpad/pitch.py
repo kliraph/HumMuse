@@ -32,6 +32,16 @@ DEFAULT_RHYTHM_CONFIDENCE_FLOOR = 0.2
 DEFAULT_PESTO_STEP_MS = 10.0
 DEFAULT_VOICING_THRESHOLD = 0.5
 DEFAULT_MAX_JUMP_SEMITONES = 1.0
+DEFAULT_ONSET_DELTA = 0.07
+# Hop length (samples) used by both PESTO (via DEFAULT_PESTO_STEP_MS) and the
+# librosa onset detector, so onset frame indices align 1:1 with PESTO frames.
+DEFAULT_ONSET_HOP_SAMPLES_AT_16K = 160  # 10 ms at 16 kHz
+# Onset-split gating thresholds (see _onset_split_passes_filter). Tuned so
+# release transients, passing tones, and overtone spikes are rejected while
+# genuine repeated notes in legato singing are honoured.
+DEFAULT_ONSET_FILTER_MAX_PITCH_STDDEV_SEMITONES = 0.5
+DEFAULT_ONSET_FILTER_AMPLITUDE_VALLEY_RATIO = 0.85
+DEFAULT_RMS_FRAME_SAMPLES = 400  # 25 ms at 16 kHz
 
 _pesto_predict = None
 
@@ -192,6 +202,121 @@ def detect_rhythm_fallback(
     return events
 
 
+def _compute_rms_frames(
+    audio: np.ndarray,
+    hop_samples: int,
+    *,
+    frame_samples: int = DEFAULT_RMS_FRAME_SAMPLES,
+) -> np.ndarray:
+    """Compute centred per-frame RMS on the same hop as PESTO."""
+    n = audio.shape[0]
+    if n == 0 or hop_samples <= 0:
+        return np.zeros(0, dtype=np.float32)
+    n_frames = max(1, n // hop_samples + 1)
+    rms = np.zeros(n_frames, dtype=np.float32)
+    half = max(1, frame_samples // 2)
+    audio_f64 = audio.astype(np.float64, copy=False)
+    for i in range(n_frames):
+        center = i * hop_samples
+        start = max(0, center - half)
+        end = min(n, center + half)
+        frame = audio_f64[start:end]
+        if frame.size:
+            rms[i] = float(np.sqrt(np.mean(np.square(frame))))
+    return rms
+
+
+def _onset_split_passes_filter(
+    rms: np.ndarray,
+    pitch_hz: np.ndarray,
+    onset_frame: int,
+    min_frames: int,
+    *,
+    max_pitch_stddev_semitones: float = DEFAULT_ONSET_FILTER_MAX_PITCH_STDDEV_SEMITONES,
+    amplitude_valley_ratio: float = DEFAULT_ONSET_FILTER_AMPLITUDE_VALLEY_RATIO,
+) -> bool:
+    """Decide whether an onset-driven segment split should be honoured.
+
+    Distinguishes genuine re-articulated notes from release transients,
+    passing tones, and overtone spikes by combining two signals:
+
+    1. **Amplitude valley** — the onset frame's RMS must be at most
+       ``amplitude_valley_ratio`` of the local max RMS in the few frames
+       before it. A real re-articulation has an amplitude dip + rise; a
+       release transient is just decay (no preceding rise to dip from).
+    2. **Pitch stability** — the pitch in the post-onset window must have
+       standard deviation below ``max_pitch_stddev_semitones``. A target
+       note settles flat; a passing tone is a slope.
+
+    Both must pass. Failing either means the onset is treated as noise and
+    the segment continues unbroken.
+    """
+    n = len(rms)
+    if n == 0 or onset_frame >= n:
+        return False
+
+    look_back = max(2, min_frames // 2)
+    pre_start = max(0, onset_frame - look_back)
+    post_end = min(len(pitch_hz), onset_frame + min_frames)
+
+    # Need enough post-onset frames to actually constitute a note.
+    if post_end - onset_frame < min_frames:
+        return False
+
+    # Amplitude valley: did the RMS *dip* before this onset?
+    pre_rms = rms[pre_start:onset_frame]
+    if pre_rms.size == 0:
+        return False
+    onset_rms = float(rms[onset_frame])
+    pre_max = float(np.max(pre_rms))
+    if pre_max <= 1e-9:
+        return False
+    valley_ok = onset_rms <= amplitude_valley_ratio * pre_max
+
+    # Pitch stability: is the post-onset pitch a settled target?
+    post_hz = pitch_hz[onset_frame:post_end]
+    valid = (post_hz > 0) & np.isfinite(post_hz)
+    if int(valid.sum()) < max(2, min_frames // 2):
+        return False
+    post_midi = 69.0 + 12.0 * np.log2(post_hz[valid] / 440.0)
+    stable_ok = float(np.std(post_midi)) <= max_pitch_stddev_semitones
+
+    return valley_ok and stable_ok
+
+
+def _compute_onset_frames(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    hop_length: int = DEFAULT_ONSET_HOP_SAMPLES_AT_16K,
+    delta: float = DEFAULT_ONSET_DELTA,
+) -> np.ndarray:
+    """Return librosa onset frame indices aligned to PESTO's 10 ms grid.
+
+    PESTO's frames live on a 10 ms hop. Using ``hop_length=sample_rate*0.010``
+    here means a librosa frame index ``f`` corresponds to the same time as
+    PESTO's frame ``f``, so we can use librosa onsets as direct boundary
+    signals inside :func:`_segment_pitch_frames`.
+    """
+    if librosa is None or audio.size == 0 or sample_rate <= 0:
+        return np.array([], dtype=int)
+    try:
+        envelope = librosa.onset.onset_strength(
+            y=audio.astype(np.float64), sr=sample_rate, hop_length=hop_length
+        )
+        onsets = librosa.onset.onset_detect(
+            onset_envelope=envelope,
+            sr=sample_rate,
+            hop_length=hop_length,
+            units="frames",
+            backtrack=False,
+            delta=delta,
+        )
+    except Exception:
+        return np.array([], dtype=int)
+    return np.asarray(onsets, dtype=int)
+
+
 def _segment_pitch_frames(
     pitch_hz: np.ndarray,
     confidence: np.ndarray,
@@ -202,8 +327,25 @@ def _segment_pitch_frames(
     minimum_note_length_ms: float,
     voicing_threshold: float = DEFAULT_VOICING_THRESHOLD,
     max_jump_semitones: float = DEFAULT_MAX_JUMP_SEMITONES,
+    onset_frames: np.ndarray | None = None,
+    rms_frames: np.ndarray | None = None,
+    onset_filter_enabled: bool = True,
 ) -> list[NoteEvent]:
-    """Collapse frame-wise (Hz, confidence) into note events."""
+    """Collapse frame-wise (Hz, confidence) into note events.
+
+    When ``onset_frames`` is provided, the segmenter additionally splits the
+    running segment at each onset frame (provided the segment already meets
+    the minimum-length guard). This recovers repeated-pitch notes in legato
+    singing, where the pitch trajectory is continuous but amplitude/spectral
+    onsets mark the note boundaries. Without onsets the behaviour reduces to
+    pitch-jump segmentation only.
+
+    When ``rms_frames`` is also provided and ``onset_filter_enabled`` is True,
+    each onset split is gated by :func:`_onset_split_passes_filter` which
+    rejects release transients, passing tones, and overtone spikes. Set
+    ``onset_filter_enabled=False`` to honour every onset (the unfiltered
+    mode used during development to measure the filter's contribution).
+    """
     if pitch_hz.shape != confidence.shape or pitch_hz.size == 0:
         return []
 
@@ -217,6 +359,9 @@ def _segment_pitch_frames(
     midi[voiced] = 69.0 + 12.0 * np.log2(pitch_hz[voiced] / 440.0)
 
     min_frames = max(1, int(np.ceil((float(minimum_note_length_ms) / 1000.0) / hop_s)))
+    onset_set: set[int] = (
+        {int(f) for f in onset_frames} if onset_frames is not None and len(onset_frames) > 0 else set()
+    )
 
     events: list[NoteEvent] = []
     cur_midi: list[float] = []
@@ -255,7 +400,15 @@ def _segment_pitch_frames(
             cur_midi = [float(m)]
             cur_conf = [float(confidence[i])]
             continue
-        if abs(m - float(np.median(cur_midi))) > max_jump_semitones:
+        # Force a split at strong amplitude/spectral onsets (recovers repeated
+        # pitches in legato runs that the pitch-jump rule alone can't see).
+        # The optional filter rejects release transients / passing tones /
+        # overtone spikes that would otherwise become spurious notes.
+        onset_split = (i in onset_set) and (i - cur_start) >= min_frames
+        if onset_split and onset_filter_enabled and rms_frames is not None:
+            if not _onset_split_passes_filter(rms_frames, pitch_hz, i, min_frames):
+                onset_split = False
+        if onset_split or abs(m - float(np.median(cur_midi))) > max_jump_semitones:
             flush(i)
             cur_start = i
             cur_midi = [float(m)]
@@ -275,12 +428,28 @@ def extract_melody(
     minimum_frequency: float = DEFAULT_MINIMUM_FREQUENCY,
     maximum_frequency: float = DEFAULT_MAXIMUM_FREQUENCY,
     minimum_note_length_ms: float = DEFAULT_MINIMUM_NOTE_LENGTH_MS,
+    onset_delta: float = DEFAULT_ONSET_DELTA,
+    onset_filter_enabled: bool = True,
 ) -> list[NoteEvent]:
-    """Extract monophonic note events with PESTO + median-filter segmenter."""
+    """Extract monophonic note events with PESTO + median-filter segmenter.
+
+    Onset detection is run alongside PESTO and used as an additional split
+    signal inside :func:`_segment_pitch_frames` (see its docstring). The
+    librosa hop is locked to PESTO's 10 ms grid so frame indices align.
+
+    ``onset_filter_enabled`` (default True) gates each onset split by pitch
+    stability and amplitude valley signals to reject release transients,
+    passing tones, and overtone spikes. Set False to honour every onset.
+    """
     if audio.size == 0 or sample_rate <= 0:
         return []
     waveform = np.clip(audio.astype(np.float32, copy=False), -1.0, 1.0)
     pitch_hz, confidence, hop_s = _pesto_extract_frames(waveform, sample_rate)
+    librosa_hop = max(1, int(round(sample_rate * hop_s)))
+    onset_frames = _compute_onset_frames(
+        waveform, sample_rate, hop_length=librosa_hop, delta=onset_delta
+    )
+    rms_frames = _compute_rms_frames(waveform, librosa_hop) if onset_filter_enabled else None
     return _segment_pitch_frames(
         pitch_hz,
         confidence,
@@ -288,6 +457,9 @@ def extract_melody(
         minimum_frequency=minimum_frequency,
         maximum_frequency=maximum_frequency,
         minimum_note_length_ms=minimum_note_length_ms,
+        onset_frames=onset_frames,
+        rms_frames=rms_frames,
+        onset_filter_enabled=onset_filter_enabled,
     )
 
 
