@@ -65,9 +65,17 @@ _SESSION_PARAM_SCHEMA = {
     "properties": {
         "requested_target": {"type": "string", "minLength": 1},
         "preserve": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        # `emotion` is the single whole-session mood channel: a free-form label
+        # (sibling of `genre`) plus optional numeric valence/arousal. When the
+        # user expresses a global mood, emit `emotion` AND
+        # `emotion_valence`/`emotion_arousal` so the session emotion vector is
+        # driven by your own inference rather than a keyword table — this lets
+        # nuanced labels ("wistful", "bittersweet") move the vector. Omit the
+        # numbers when no emotional shift is implied.
         "emotion": {"type": "string", "minLength": 1},
+        "emotion_valence": {"type": "number", "minimum": -1, "maximum": 1},
+        "emotion_arousal": {"type": "number", "minimum": -1, "maximum": 1},
         "genre": {"type": "string", "minLength": 1},
-        "mood": {"type": "string", "minLength": 1},
     },
 }
 
@@ -270,11 +278,35 @@ FEW_SHOT_EXAMPLES: list[dict[str, Any]] = [
             "operations": [
                 {
                     "target": "session",
-                    "params": {"preserve": ["melody"], "emotion": "hopeful"},
+                    "params": {
+                        "preserve": ["melody"],
+                        "emotion": "hopeful",
+                        "emotion_valence": 0.45,
+                        "emotion_arousal": 0.35,
+                    },
                     "rationale": "This changes global session intent while preserving melody.",
                 }
             ],
             "interpretation": "Update the session mood while keeping the melody fixed.",
+        },
+    },
+    {
+        "name": "nuanced_session_mood",
+        "instruction": "give the whole thing a wistful, bittersweet feel",
+        "chat_history": [],
+        "output": {
+            "operations": [
+                {
+                    "target": "session",
+                    "params": {
+                        "emotion": "wistful",
+                        "emotion_valence": -0.2,
+                        "emotion_arousal": -0.25,
+                    },
+                    "rationale": "Wistful/bittersweet is a slightly negative, low-energy global mood.",
+                }
+            ],
+            "interpretation": "Set a wistful, bittersweet emotional tone across the session.",
         },
     },
     {

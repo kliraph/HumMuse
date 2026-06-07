@@ -14,10 +14,11 @@ from ml.gpt.client import GPTClient, LLMResponse
 from ml.gpt.context_builder import SessionContext, build_session_context
 from ml.gpt.prompts.explain import build_explanation_prompt
 from ml.gpt.prompts.lyrics import build_lyric_prompt
+from ml.gpt.prompts.mood import build_mood_prompt
 from ml.gpt.prompts.refine import build_refinement_prompt, parse_refinement_plan
 from shared.schemas import SessionState
 
-GPTUseCase = Literal["lyric", "refine", "explain"]
+GPTUseCase = Literal["lyric", "refine", "explain", "mood"]
 LOGGER = logging.getLogger(__name__)
 DEFAULT_EVAL_SEED = 0
 
@@ -100,6 +101,7 @@ class GPTPipeline:
         num_suggestions: int = 3,
         syllable_targets_per_line: list[int] | None = None,
         target_hint: str | None = None,
+        language: str | None = None,
     ) -> GPTPipelineResult:
         prompt = self._build_prompt(
             use_case,
@@ -109,6 +111,7 @@ class GPTPipeline:
             num_suggestions=num_suggestions,
             syllable_targets_per_line=syllable_targets_per_line,
             target_hint=target_hint,
+            language=language,
         )
         request_payload = self._request_payload(use_case, prompt, user_input)
         prompt_hash = _hash_payload(request_payload)
@@ -161,6 +164,7 @@ class GPTPipeline:
         num_suggestions: int,
         syllable_targets_per_line: list[int] | None,
         target_hint: str | None,
+        language: str | None = None,
     ) -> Any:
         if use_case == "lyric":
             context = build_session_context(
@@ -183,8 +187,11 @@ class GPTPipeline:
             return build_refinement_prompt(context, instruction=user_input, target_hint=target_hint)
         if use_case == "explain":
             context = build_session_context("explain", session_state, last_user_question=user_input)
-            return build_explanation_prompt(context, question=user_input)
-        raise ValueError("use_case must be 'lyric', 'refine', or 'explain'")
+            return build_explanation_prompt(context, question=user_input, language=language)
+        if use_case == "mood":
+            context = build_session_context("mood", session_state, lyrics_text=user_input)
+            return build_mood_prompt(context, language=language)
+        raise ValueError("use_case must be 'lyric', 'refine', 'explain', or 'mood'")
 
     def _request_payload(self, use_case: GPTUseCase, prompt: Any, user_input: str) -> dict[str, Any]:
         return {
@@ -215,9 +222,9 @@ class GPTPipeline:
     def _parse_response(self, use_case: GPTUseCase, content: str) -> Any:
         if use_case == "refine":
             return parse_refinement_plan(content)
-        if use_case in ("lyric", "explain"):
+        if use_case in ("lyric", "explain", "mood"):
             return _parse_json_or_text(content)
-        raise ValueError("use_case must be 'lyric', 'refine', or 'explain'")
+        raise ValueError("use_case must be 'lyric', 'refine', 'explain', or 'mood'")
 
     def _result_from_cached(self, use_case: GPTUseCase, cached: str, *, latency_ms: float) -> GPTPipelineResult:
         data = json.loads(cached)

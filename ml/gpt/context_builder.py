@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from ml.gpt.abc_serializer import session_state_to_abc
+from ml.gpt.syllable import count_syllables
 from ml.gpt.tier1_formatter import compact_explanation_report_for_prompt, format_tier1_summary
 from shared.schemas import ChatMessage, ChordProgression, SessionState
 
-GPTUseCase = Literal["lyric", "refine", "explain"]
+GPTUseCase = Literal["lyric", "refine", "explain", "mood"]
 
-_WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?", re.IGNORECASE)
-_VOWEL_GROUP_RE = re.compile(r"[aeiouy]+", re.IGNORECASE)
 _DEFAULT_RECENT_CHAT_MESSAGES = 6
 
 
@@ -52,6 +50,7 @@ class SessionContextBuilder:
         *,
         syllable_targets_per_line: Sequence[int] | None = None,
         last_user_question: str | None = None,
+        lyrics_text: str | None = None,
     ) -> SessionContext:
         if use_case == "lyric":
             return self.lyric_context(session_state, syllable_targets_per_line=syllable_targets_per_line)
@@ -59,7 +58,9 @@ class SessionContextBuilder:
             return self.refine_context(session_state, syllable_targets_per_line=syllable_targets_per_line)
         if use_case == "explain":
             return self.explain_context(session_state, last_user_question=last_user_question)
-        raise ValueError("use_case must be 'lyric', 'refine', or 'explain'")
+        if use_case == "mood":
+            return self.mood_context(session_state, lyrics_text=lyrics_text)
+        raise ValueError("use_case must be 'lyric', 'refine', 'explain', or 'mood'")
 
     def lyric_context(
         self,
@@ -84,6 +85,15 @@ class SessionContextBuilder:
         )
         fields["last_refinement_plan_results"] = _last_refinement_results(session_state.user_params)
         return SessionContext(use_case="refine", fields=fields)
+
+    def mood_context(
+        self,
+        session_state: SessionState,
+        *,
+        lyrics_text: str | None = None,
+    ) -> SessionContext:
+        text = (lyrics_text if lyrics_text is not None else session_state.lyrics_text) or ""
+        return SessionContext(use_case="mood", fields={"lyrics_text": text})
 
     def explain_context(
         self,
@@ -126,6 +136,7 @@ def build_session_context(
     *,
     syllable_targets_per_line: Sequence[int] | None = None,
     last_user_question: str | None = None,
+    lyrics_text: str | None = None,
     recent_chat_messages: int = _DEFAULT_RECENT_CHAT_MESSAGES,
 ) -> SessionContext:
     """Convenience wrapper around `SessionContextBuilder`."""
@@ -134,6 +145,7 @@ def build_session_context(
         session_state,
         syllable_targets_per_line=syllable_targets_per_line,
         last_user_question=last_user_question,
+        lyrics_text=lyrics_text,
     )
 
 
@@ -175,29 +187,10 @@ def _last_refinement_results(user_params: Mapping[str, Any]) -> dict[str, Any]:
 
 def _derive_syllable_targets(previous_lyrics: str) -> list[int]:
     return [
-        _count_syllables(line)
+        count_syllables(line)
         for line in previous_lyrics.splitlines()
         if line.strip()
     ]
-
-
-def _count_syllables(text: str) -> int:
-    return sum(_count_word_syllables(word) for word in _WORD_RE.findall(text))
-
-
-def _count_word_syllables(word: str) -> int:
-    cleaned = re.sub(r"[^a-z]", "", word.lower())
-    if not cleaned:
-        return 0
-    if len(cleaned) <= 3:
-        return 1
-
-    syllables = len(_VOWEL_GROUP_RE.findall(cleaned))
-    if cleaned.endswith("e") and not cleaned.endswith(("le", "ye")) and syllables > 1:
-        syllables -= 1
-    if cleaned.endswith(("es", "ed")) and not cleaned.endswith(("ted", "ded")) and syllables > 1:
-        syllables -= 1
-    return max(1, syllables)
 
 
 def _chat_messages_to_dicts(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:

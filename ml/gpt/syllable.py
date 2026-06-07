@@ -7,8 +7,16 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-_WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?", re.IGNORECASE)
-_VOWEL_GROUP_RE = re.compile(r"[aeiouy]+", re.IGNORECASE)
+_WORD_RE = re.compile(r"[a-zа-яё]+(?:'[a-zа-яё]+)?", re.IGNORECASE)
+_ENGLISH_VOWEL_GROUP_RE = re.compile(r"[aeiouy]+", re.IGNORECASE)
+_RUSSIAN_VOWEL_RE = re.compile(r"[аеёиоуыэюя]", re.IGNORECASE)
+_CYRILLIC_LETTER_RE = re.compile(r"[а-яё]", re.IGNORECASE)
+_LATIN_LETTER_RE = re.compile(r"[a-z]", re.IGNORECASE)
+# A plural/3rd-person "-es" is its own syllable (/ɪz/) after a sibilant stem:
+# s, z, x, soft c/g, or the digraphs ch/sh. So "dishes", "races", "changes"
+# must NOT have the "-es" decrement applied. (Rare hard-/k/ "aches" is mis-served
+# by the soft-c/g shortcut, but that's an acceptable miss for a heuristic.)
+_SIBILANT_PLURAL_RE = re.compile(r"(?:[szxcg]|[cs]h)es$")
 _DEFAULT_MAX_RETRIES = 2
 
 
@@ -49,22 +57,65 @@ class LyricRetryResult:
 
 
 def count_syllables(text: str) -> int:
-    """Count approximate English syllables in free text."""
+    """Count approximate syllables in free text (English and Russian)."""
     return sum(count_word_syllables(word) for word in _WORD_RE.findall(text))
 
 
 def count_word_syllables(word: str) -> int:
-    """Count approximate English syllables in a single word."""
-    cleaned = re.sub(r"[^a-z]", "", word.lower())
+    """Count approximate syllables in a single word.
+
+    Dispatches per script: Russian words count one syllable per vowel letter
+    (а, е, ё, и, о, у, ы, э, ю, я); English words use a vowel-group heuristic
+    with silent-e / -es / -ed adjustments. Mixed-script tokens (rare; usually
+    transliterations) sum both counts so the line total isn't undercounted.
+    """
+    lowered = word.lower()
+    has_cyrillic = bool(_CYRILLIC_LETTER_RE.search(lowered))
+    has_latin = bool(_LATIN_LETTER_RE.search(lowered))
+    if has_cyrillic and not has_latin:
+        return _count_russian_word_syllables(lowered)
+    if has_latin and not has_cyrillic:
+        return _count_english_word_syllables(lowered)
+    if has_cyrillic and has_latin:
+        return _count_russian_word_syllables(lowered) + _count_english_word_syllables(lowered)
+    return 0
+
+
+def _count_russian_word_syllables(word: str) -> int:
+    return len(_RUSSIAN_VOWEL_RE.findall(word))
+
+
+def _count_english_word_syllables(word: str) -> int:
+    cleaned = re.sub(r"[^a-z]", "", word)
     if not cleaned:
         return 0
     if len(cleaned) <= 3:
         return 1
 
-    syllables = len(_VOWEL_GROUP_RE.findall(cleaned))
-    if cleaned.endswith("e") and not cleaned.endswith(("le", "ye")) and syllables > 1:
+    syllables = len(_ENGLISH_VOWEL_GROUP_RE.findall(cleaned))
+    # Silent terminal "e" ("make", "tone"). The vowel-group regex already
+    # collapses pronounced vowel-vowel endings ("agree", "value", "argue") into
+    # one group with the preceding vowel, so guarding only "le"/"ye" would
+    # over-strip those — require the char before the final "e" to be a
+    # consonant so we only drop a genuinely silent, standalone "e".
+    if (
+        cleaned.endswith("e")
+        and not cleaned.endswith(("le", "ye"))
+        and len(cleaned) >= 2
+        and cleaned[-2] not in "aeiou"
+        and syllables > 1
+    ):
         syllables -= 1
-    if cleaned.endswith(("es", "ed")) and not cleaned.endswith(("ted", "ded")) and syllables > 1:
+    # Silent "-es"/"-ed": both add a syllable when the stem already ends in the
+    # matching sibilant ("-es" after s/z/x/soft-c-g/ch/sh) or stop ("-ed" after
+    # t/d); otherwise they are silent and the vowel group must be removed.
+    if (
+        cleaned.endswith("es")
+        and not _SIBILANT_PLURAL_RE.search(cleaned)
+        and syllables > 1
+    ):
+        syllables -= 1
+    elif cleaned.endswith("ed") and not cleaned.endswith(("ted", "ded")) and syllables > 1:
         syllables -= 1
     return max(1, syllables)
 

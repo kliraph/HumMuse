@@ -39,8 +39,14 @@ def current_language() -> str:
     return st.session_state.get("language", DEFAULT_LANGUAGE)
 
 
-def t(key: str, **kwargs: Any) -> str:
-    """Look up a translation for ``key`` and format with ``kwargs``.
+def t(i18n_key: str, **kwargs: Any) -> str:
+    """Look up a translation for ``i18n_key`` and format with ``kwargs``.
+
+    The positional parameter is named ``i18n_key`` rather than ``key``
+    so callers can pass a ``key=`` substitution variable (e.g. a
+    musical key letter) without colliding with the parameter name.
+    All callsites pass the translation key positionally, so the
+    rename has no effect on existing code.
 
     Resolution order:
         1. Current language's table.
@@ -53,9 +59,9 @@ def t(key: str, **kwargs: Any) -> str:
     """
     lang = current_language()
     table = TRANSLATIONS.get(lang, TRANSLATIONS[DEFAULT_LANGUAGE])
-    template = table.get(key)
+    template = table.get(i18n_key)
     if template is None:
-        template = TRANSLATIONS[DEFAULT_LANGUAGE].get(key, key)
+        template = TRANSLATIONS[DEFAULT_LANGUAGE].get(i18n_key, i18n_key)
     if not kwargs:
         return template
     try:
@@ -102,6 +108,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "snapshot.loaded": "Loaded session",
         "snapshot.extracted_melody": "Extracted melody ({n} notes)",
         "snapshot.generated_chords": "Generated chords ({n} progressions, mood={mood})",
+        "snapshot.generated_chords_from_melody": "Generated chords from melody ({n} progressions)",
+        "snapshot.mood_set": "Set mood: {mood}",
         "snapshot.manual_progression": "Manual progression: {chords}",
         "snapshot.accepted_continuation": "Accepted melody continuation #{n}",
         "snapshot.selected_progression": "Selected progression v{n}: {title}",
@@ -118,23 +126,28 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "overview.latest_refinement": "Latest refinement for `{target}`: {text}",
         "overview.interpretation": "Interpretation: {text}",
         # Story Bible panel
-        "story.expander_title": "📓 Story Bible — creative context",
-        "story.caption": (
-            "Central creative-intent fields. The graph below shows which "
-            "fields drive which subsystems — every generation can be traced "
-            "back to its inputs here. Snapshots in the sidebar capture this "
-            "alongside the artifact."
+        "brief.expander_title": "🎵 Song Brief — creative context",
+        "brief.caption": (
+            "Your song's emotional brief. The mood you pick is the single "
+            "source of truth for the song's emotion — it drives the chords, "
+            "the melody continuation, and the lyric prompts. The graph below "
+            "traces every generation back to its inputs. Snapshots in the "
+            "sidebar capture this alongside the artifact."
         ),
-        "story.mood_label": "Mood",
-        "story.mood_help": (
-            "Drives DQN chord candidate scoring, melody continuation "
-            "temperature, and the emotion vector passed to lyric prompts."
+        "brief.mood_label": "Mood",
+        "brief.mood_help": (
+            "Sets the session emotion vector — drives DQN chord candidate "
+            "scoring, melody continuation temperature, and the emotion vector "
+            "passed to lyric prompts."
         ),
-        "story.detected_header": "**Auto-detected from audio**",
-        "story.detected_key": "Key",
-        "story.detected_tempo": "Tempo",
-        "story.graph_expander": "Dependency graph",
-        "story.graph_caption": (
+        "brief.mood_authored": "✓ Mood set by you.",
+        "brief.mood_detected": "Mood inferred from your lyrics — pick one above to set it yourself.",
+        "brief.could_not_set_mood": "Could not set mood: {err}",
+        "brief.detected_header": "**Auto-detected from audio**",
+        "brief.detected_key": "Key",
+        "brief.detected_tempo": "Tempo",
+        "brief.graph_expander": "Dependency graph",
+        "brief.graph_caption": (
             "Yellow = user-controlled intent · Blue = detected from audio · "
             "Green = generative subsystems. Edge labels name what flows "
             "along each edge, and every edge corresponds to a real code "
@@ -158,20 +171,27 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "melody.upload_help": "Accepted formats: WAV, WebM, MP3",
         "melody.source_recording": "Using your recorded humming. Upload a file or clear the recording to switch.",
         "melody.source_upload": "Using uploaded file: **{name}**. Re-record or clear the upload to switch.",
-        "melody.mood_caption": "Mood: **{mood}** (single source of truth — edit in the Story Bible panel above).",
         "melody.extract_button": "Extract Melody",
         "melody.extracted_n": "Extracted {n} note events.",
         "melody.could_not_extract": "Could not extract melody: {err}",
         "melody.current_notes": "Current extracted notes",
         "melody.confidence_legend": "Confidence colors: green = strong, amber = usable, red = low confidence.",
         "melody.no_notes_yet": "No melody extracted yet. Record or upload audio, then click `Extract Melody`.",
-        "melody.profile_header": "Melody profile",
+        "melody.show_profile": "Show melody profile (advanced)",
         "melody.latest_extraction": "Latest extraction",
         "melody.detected_key": "Detected Key",
         "melody.detected_tempo": "Detected Tempo",
         "melody.returned_notes": "Returned Notes",
         "melody.unknown": "Unknown",
-        "melody.pipeline_timings": "Pipeline timings",
+        "melody.fallback_decode": (
+            "⚠️ Couldn't decode the uploaded audio — used a silent placeholder. "
+            "Try a different format (WAV / MP3 / WebM) or re-record."
+        ),
+        "melody.fallback_rhythm": (
+            "⚠️ Pitch confidence was low — extracted rhythm-only onsets, "
+            "not actual pitches. Try humming closer to the microphone with "
+            "sustained, clear notes."
+        ),
         "melody.play": "Play Melody",
         "melody.download_midi": "Download MIDI",
         "melody.rendered_via": "Rendered playback using {source}.",
@@ -192,6 +212,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "chords.generate_button": "Generate Chords",
         "chords.generated_n": "Generated {n} candidate progressions for a {mood} mood.",
         "chords.could_not_generate": "Could not generate chords: {err}",
+        "chords.mood_suggested": "Your lyrics read as {mood}. Adopt it as the song's mood?",
+        "chords.accept_detected_mood": "Use detected mood",
+        # Two parallel chord-generation sources in the Chords tab.
+        "chords.from_lyrics_header": "**From lyrics**",
+        "chords.from_lyrics_button": "Generate from lyrics",
+        "chords.from_melody_header": "**From melody**",
+        "chords.from_melody_button": "Generate from melody",
+        "chords.melody_notes_preview": "{n} notes detected · key {key}",
+        "chords.melody_empty_hint": "Hum or upload a melody in the **Melody** tab to enable melody-driven chord generation.",
+        "chords.generated_from_melody_n": "Generated {n} candidate progressions from the melody.",
+        "chords.could_not_generate_from_melody": "Could not generate chords from melody: {err}",
         "chords.manual_header": "**Type your own progression**",
         "chords.manual_caption": (
             "Bypass lyric/DQN inference and supply a progression directly. "
@@ -213,6 +244,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "chords.committed_variant": "Committed variant {n}.",
         "chords.could_not_commit": "Could not commit progression: {err}",
         "chords.no_progressions": "No chord progressions yet.",
+        # Chord-card score badges + technical expander
+        "chords.model_confidence": "Model confidence",
+        "chords.mood_alignment": "Mood alignment",
+        "chords.harmonic_function": "Harmonic function",
+        "chords.show_technical": "Show technical details (advanced)",
+        "chords.annotations_header": "Derived chord-symbol annotations",
+        "chords.distributions_header": "Chord head policy and Q-values",
         # Suggestions tab
         "suggestions.subheader": "Suggestions",
         "suggestions.placeholder": "Suggestion tools become available once a session is active.",
@@ -244,7 +282,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "suggestions.generate_lyrics": "Generate Lyric Suggestions",
         "suggestions.generated_lyrics_n": "Generated {n} lyric options.",
         "suggestions.could_not_generate_lyrics": "Could not generate lyric suggestions: {err}",
-        "suggestions.lyric_caption": "Mode: {mode} | Syllables: {syllables}",
+        "suggestions.lyric_caption": "Style: {mode} · Syllables per line: {syllables}",
         "suggestions.no_lyrics": "No lyric suggestions yet.",
         # Explanations tab
         "explanations.subheader": "Explanations",
@@ -260,6 +298,26 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "explanations.send_button": "Send Question",
         "explanations.replied": "Received explanation reply.",
         "explanations.could_not_send": "Could not send explanation question: {err}",
+        # Provenance line shown above the raw-report expander.
+        "explanations.action_label": "Action",
+        "explanations.model_label": "Model",
+        "explanations.cache_label": "Cache",
+        "explanations.cache_hit": "hit",
+        "explanations.cache_miss": "miss",
+        "explanations.show_raw_report": "Show raw report (advanced)",
+        # Friendly labels for backend `source_action` slugs. Unknown
+        # slugs fall back to a cleaned-up display in code, so this
+        # table only needs to cover the actions the backend currently
+        # emits (see backend/app.py).
+        "explanations.action.melody_from_hum": "Extracted melody from audio",
+        "explanations.action.chords_from_lyrics": "Generated chords from lyrics",
+        "explanations.action.chords_from_melody": "Generated chords from melody",
+        "explanations.action.chords_manual": "Saved manual chord progression",
+        "explanations.action.melody_continue": "Generated melody continuations",
+        "explanations.action.melody_continue_accept": "Accepted a melody continuation",
+        "explanations.action.suggest_lyrics": "Generated lyric suggestions",
+        "explanations.action.session_refine": "Applied a refinement",
+        "explanations.action.session_chat": "Answered an explanation question",
         # Refinement panel
         "refine.header": "**Refine This Section**",
         "refine.placeholder": "Refinement instruction",
@@ -275,15 +333,20 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "target.chords": "chords",
         "target.suggestions": "suggestions",
         "target.session": "session",
-        # Mood display (values stay English; only the label changes)
+        # Mood display — the 12 canonical presets (values stay English; only
+        # the label changes). Must cover EMOTION_PRESET_LABELS.
+        "mood.joyful": "joyful",
+        "mood.triumphant": "triumphant",
         "mood.uplift": "uplift",
-        "mood.melancholy": "melancholy",
-        "mood.tense": "tense",
-        "mood.calm": "calm",
-        "mood.energetic": "energetic",
+        "mood.hopeful": "hopeful",
         "mood.romantic": "romantic",
+        "mood.calm": "calm",
+        "mood.neutral": "neutral",
+        "mood.reflective": "reflective",
+        "mood.melancholic": "melancholic",
         "mood.dark": "dark",
-        "mood.playful": "playful",
+        "mood.anxious": "anxious",
+        "mood.tense": "tense",
         # Section display
         "section.Any": "Any",
         "section.verse": "verse",
@@ -303,6 +366,18 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "lyrics.generated_n": "Generated {n} lyric options.",
         "lyrics.could_not_generate": "Could not generate lyric suggestions: {err}",
         "lyrics.no_suggestions": "No lyric suggestions yet.",
+        "lyrics.mode_label": "Style",
+        "lyrics.mode_help": (
+            "Simpler = plain direct language; "
+            "Poetic = vivid imagery and metaphor; "
+            "Catchy = hooks, repetition, and chorus energy."
+        ),
+        # Closed taxonomy of GPT lyric generation styles. Values stay
+        # English because the backend keys on them; this maps each value
+        # to its display label for the picker and the result cards.
+        "lyric_mode.Simpler": "Simpler",
+        "lyric_mode.Poetic": "Poetic",
+        "lyric_mode.Catchy": "Catchy",
         # Chord tab: lyrics now live in their own tab; preview here
         "chords.lyrics_preview_header": "**Lyrics (from Lyrics tab)**",
         "chords.lyrics_empty_hint": "Add lyrics in the **Lyrics** tab to enable chord generation from text.",
@@ -349,6 +424,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "snapshot.loaded": "Сессия загружена",
         "snapshot.extracted_melody": "Извлечена мелодия ({n} нот)",
         "snapshot.generated_chords": "Сгенерированы аккорды ({n} вариантов, настроение={mood})",
+        "snapshot.generated_chords_from_melody": "Сгенерированы аккорды из мелодии ({n} вариантов)",
+        "snapshot.mood_set": "Задано настроение: {mood}",
         "snapshot.manual_progression": "Ручная последовательность: {chords}",
         "snapshot.accepted_continuation": "Принято продолжение мелодии №{n}",
         "snapshot.selected_progression": "Выбрана прогрессия v{n}: {title}",
@@ -364,24 +441,29 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "overview.current_session_id": "ID текущей сессии: `{sid}`",
         "overview.latest_refinement": "Последняя доработка для `{target}`: {text}",
         "overview.interpretation": "Интерпретация: {text}",
-        # Story Bible panel
-        "story.expander_title": "📓 Story Bible — творческий контекст",
-        "story.caption": (
-            "Центральные поля творческого замысла. Граф ниже показывает, "
-            "какие поля влияют на какие подсистемы — каждое порождение "
-            "можно проследить до его входов. Снимки в боковой панели "
+        # Song Brief panel
+        "brief.expander_title": "🎵 Камертон — творческий контекст",
+        "brief.caption": (
+            "Эмоциональный камертон песни. Выбранное настроение — единый "
+            "источник истины для эмоции песни: оно влияет на аккорды, "
+            "продолжение мелодии и генерацию текстов. Граф ниже прослеживает "
+            "каждое порождение до его входов. Снимки в боковой панели "
             "сохраняют это вместе с артефактом."
         ),
-        "story.mood_label": "Настроение",
-        "story.mood_help": (
-            "Влияет на оценку аккордов в DQN, температуру продолжения "
-            "мелодии и эмоциональный вектор для генерации текстов."
+        "brief.mood_label": "Настроение",
+        "brief.mood_help": (
+            "Задаёт эмоциональный вектор сессии — влияет на оценку аккордов "
+            "в DQN, температуру продолжения мелодии и эмоциональный вектор "
+            "для генерации текстов."
         ),
-        "story.detected_header": "**Определено автоматически из аудио**",
-        "story.detected_key": "Тональность",
-        "story.detected_tempo": "Темп",
-        "story.graph_expander": "Граф зависимостей",
-        "story.graph_caption": (
+        "brief.mood_authored": "✓ Настроение задано вами.",
+        "brief.mood_detected": "Настроение определено из текста — выберите выше, чтобы задать вручную.",
+        "brief.could_not_set_mood": "Не удалось задать настроение: {err}",
+        "brief.detected_header": "**Определено автоматически из аудио**",
+        "brief.detected_key": "Тональность",
+        "brief.detected_tempo": "Темп",
+        "brief.graph_expander": "Граф зависимостей",
+        "brief.graph_caption": (
             "Жёлтый = намерения пользователя · Синий = определено из аудио · "
             "Зелёный = генеративные подсистемы. Подписи рёбер показывают, "
             "что передаётся по каждому ребру; всё соответствует реальному "
@@ -405,20 +487,27 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "melody.upload_help": "Поддерживаемые форматы: WAV, WebM, MP3",
         "melody.source_recording": "Используется запись напева. Загрузите файл или очистите запись, чтобы переключиться.",
         "melody.source_upload": "Используется загруженный файл: **{name}**. Перезапишите напев или очистите загрузку, чтобы переключиться.",
-        "melody.mood_caption": "Настроение: **{mood}** (единственный источник истины — редактируется в Story Bible выше).",
         "melody.extract_button": "Извлечь мелодию",
         "melody.extracted_n": "Извлечено нот: {n}.",
         "melody.could_not_extract": "Не удалось извлечь мелодию: {err}",
         "melody.current_notes": "Текущие извлечённые ноты",
         "melody.confidence_legend": "Цвета уверенности: зелёный = высокая, жёлтый = приемлемая, красный = низкая.",
         "melody.no_notes_yet": "Мелодия ещё не извлечена. Запишите или загрузите аудио и нажмите «Извлечь мелодию».",
-        "melody.profile_header": "Профиль мелодии",
+        "melody.show_profile": "Показать профиль мелодии (диагностика)",
         "melody.latest_extraction": "Последнее извлечение",
         "melody.detected_key": "Определённая тональность",
         "melody.detected_tempo": "Определённый темп",
         "melody.returned_notes": "Возвращено нот",
         "melody.unknown": "Неизвестно",
-        "melody.pipeline_timings": "Время выполнения пайплайна",
+        "melody.fallback_decode": (
+            "⚠️ Не удалось декодировать аудио — использован пустой заполнитель. "
+            "Попробуйте другой формат (WAV / MP3 / WebM) или перезапишите."
+        ),
+        "melody.fallback_rhythm": (
+            "⚠️ Уверенность распознавания высоты низкая — использованы только "
+            "ритмические onset-ы, без реальных нот. Попробуйте напевать ближе "
+            "к микрофону, тянуть ноты дольше и чётче."
+        ),
         "melody.play": "Воспроизвести мелодию",
         "melody.download_midi": "Скачать MIDI",
         "melody.rendered_via": "Воспроизведение через: {source}.",
@@ -439,6 +528,17 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "chords.generate_button": "Сгенерировать аккорды",
         "chords.generated_n": "Сгенерировано вариантов прогрессий: {n} для настроения «{mood}».",
         "chords.could_not_generate": "Не удалось сгенерировать аккорды: {err}",
+        "chords.mood_suggested": "Текст звучит как {mood}. Сделать это настроением песни?",
+        "chords.accept_detected_mood": "Использовать определённое настроение",
+        # Два параллельных источника генерации аккордов
+        "chords.from_lyrics_header": "**Из текста**",
+        "chords.from_lyrics_button": "Сгенерировать из текста",
+        "chords.from_melody_header": "**Из мелодии**",
+        "chords.from_melody_button": "Сгенерировать из мелодии",
+        "chords.melody_notes_preview": "Распознано нот: {n} · тональность {key}",
+        "chords.melody_empty_hint": "Запишите или загрузите мелодию во вкладке **«Мелодия»**, чтобы включить генерацию аккордов из мелодии.",
+        "chords.generated_from_melody_n": "Сгенерировано вариантов прогрессий из мелодии: {n}.",
+        "chords.could_not_generate_from_melody": "Не удалось сгенерировать аккорды из мелодии: {err}",
         "chords.manual_header": "**Введите свою последовательность**",
         "chords.manual_caption": (
             "Обойти вывод из текста/DQN и задать прогрессию напрямую. "
@@ -460,6 +560,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "chords.committed_variant": "Зафиксирован вариант {n}.",
         "chords.could_not_commit": "Не удалось зафиксировать прогрессию: {err}",
         "chords.no_progressions": "Прогрессий пока нет.",
+        # Chord-card score badges + technical expander
+        "chords.model_confidence": "Уверенность модели",
+        "chords.mood_alignment": "Соответствие настроению",
+        "chords.harmonic_function": "Гармоническая функция",
+        "chords.show_technical": "Показать технические детали (диагностика)",
+        "chords.annotations_header": "Производные обозначения аккордов",
+        "chords.distributions_header": "Политика и Q-значения",
         # Suggestions tab
         "suggestions.subheader": "Подсказки",
         "suggestions.placeholder": "Инструменты подсказок появятся после активации сессии.",
@@ -491,7 +598,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "suggestions.generate_lyrics": "Сгенерировать варианты текста",
         "suggestions.generated_lyrics_n": "Сгенерировано вариантов текста: {n}.",
         "suggestions.could_not_generate_lyrics": "Не удалось сгенерировать варианты текста: {err}",
-        "suggestions.lyric_caption": "Режим: {mode} | Слогов: {syllables}",
+        "suggestions.lyric_caption": "Стиль: {mode} · Слогов в строке: {syllables}",
         "suggestions.no_lyrics": "Вариантов текста пока нет.",
         # Explanations tab
         "explanations.subheader": "Объяснения",
@@ -507,6 +614,23 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "explanations.send_button": "Отправить вопрос",
         "explanations.replied": "Получен ответ-объяснение.",
         "explanations.could_not_send": "Не удалось отправить вопрос: {err}",
+        # Provenance line shown above the raw-report expander.
+        "explanations.action_label": "Действие",
+        "explanations.model_label": "Модель",
+        "explanations.cache_label": "Кэш",
+        "explanations.cache_hit": "попадание",
+        "explanations.cache_miss": "промах",
+        "explanations.show_raw_report": "Показать исходный отчёт (диагностика)",
+        # Friendly labels for backend `source_action` slugs.
+        "explanations.action.melody_from_hum": "Извлечена мелодия из аудио",
+        "explanations.action.chords_from_lyrics": "Сгенерированы аккорды из текста",
+        "explanations.action.chords_from_melody": "Сгенерированы аккорды из мелодии",
+        "explanations.action.chords_manual": "Сохранена ручная прогрессия",
+        "explanations.action.melody_continue": "Сгенерированы продолжения мелодии",
+        "explanations.action.melody_continue_accept": "Принято продолжение мелодии",
+        "explanations.action.suggest_lyrics": "Сгенерированы варианты текста",
+        "explanations.action.session_refine": "Применена доработка",
+        "explanations.action.session_chat": "Дан ответ на вопрос-объяснение",
         # Refinement panel
         "refine.header": "**Доработать этот раздел**",
         "refine.placeholder": "Инструкция для доработки",
@@ -522,15 +646,19 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "target.chords": "аккорды",
         "target.suggestions": "подсказки",
         "target.session": "сессия",
-        # Mood display
+        # Mood display — the 12 canonical presets.
+        "mood.joyful": "радостно",
+        "mood.triumphant": "триумфально",
         "mood.uplift": "вдохновение",
-        "mood.melancholy": "меланхолия",
-        "mood.tense": "напряжение",
-        "mood.calm": "спокойствие",
-        "mood.energetic": "энергично",
+        "mood.hopeful": "обнадёживающе",
         "mood.romantic": "романтично",
+        "mood.calm": "спокойствие",
+        "mood.neutral": "нейтрально",
+        "mood.reflective": "задумчиво",
+        "mood.melancholic": "меланхолия",
         "mood.dark": "мрачно",
-        "mood.playful": "игриво",
+        "mood.anxious": "тревожно",
+        "mood.tense": "напряжение",
         # Section display
         "section.Any": "Любая",
         "section.verse": "куплет",
@@ -551,6 +679,15 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "lyrics.generated_n": "Сгенерировано вариантов текста: {n}.",
         "lyrics.could_not_generate": "Не удалось сгенерировать варианты текста: {err}",
         "lyrics.no_suggestions": "Вариантов текста пока нет.",
+        "lyrics.mode_label": "Стиль",
+        "lyrics.mode_help": (
+            "Simpler = простой прямой язык; "
+            "Poetic = образность и метафоры; "
+            "Catchy = крючки, повторы, припевная энергия."
+        ),
+        "lyric_mode.Simpler": "Простой",
+        "lyric_mode.Poetic": "Поэтичный",
+        "lyric_mode.Catchy": "Запоминающийся",
         # Chord tab: lyrics now live in their own tab; preview here
         "chords.lyrics_preview_header": "**Текст (из вкладки «Тексты»)**",
         "chords.lyrics_empty_hint": "Добавьте текст во вкладке **«Тексты»**, чтобы включить генерацию аккордов из текста.",

@@ -58,7 +58,6 @@ Endpoints:
 - `POST /suggest/lyrics`
 - `PATCH /session/{id}/refine`
 - `POST /session/{id}/chat`
-- `POST /writerblock/help`
 - `GET /artifact/{artifact_id}`
 - `GET /artifact/{artifact_id}/{filename}`
 

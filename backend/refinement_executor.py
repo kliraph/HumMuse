@@ -25,7 +25,7 @@ from typing import Any, Literal
 
 from backend.logging_config import get_logger
 from backend.lyric_responder import generate_lyric_suggestions
-from backend.mock_pipeline import build_emotion_vector
+from backend.mock_pipeline import lookup_emotion_preset
 from ml.gpt.pipeline import GPTPipeline
 from ml.harmony import generate_chords as generate_dqn_chords
 from ml.melody_sketchpad.continuation.pipeline import continue_melody as run_continuation_pipeline
@@ -201,8 +201,11 @@ def _adjust_emotion_vector(current: EmotionVector, params: dict[str, Any]) -> Em
         delta = _TENSION_VALENCE_DELTA.get(tension.lower())
         if delta is not None:
             valence += delta
-            # Tension also nudges arousal: higher tension -> higher arousal.
-            arousal += -delta if delta < 0 else -delta
+            # Tension also nudges arousal in the opposite direction to its
+            # valence delta: higher tension (negative valence delta) raises
+            # arousal, lower tension lowers it. `-delta` already encodes that;
+            # the extra ±0.15 is a fixed reinforcing nudge in the same direction.
+            arousal -= delta
             arousal = _clip(arousal + (0.15 if delta < 0 else -0.15), *_AROUSAL_BOUNDS)
 
     if params.get("prefer_minor_color") is True:
@@ -361,17 +364,26 @@ def _execute_session(state: SessionState, op: RefinementOp) -> OperationResult:
     if "genre" in params:
         state.user_params["genre"] = params["genre"]
         merged_keys.append("genre")
-    if "mood" in params:
-        state.user_params["mood"] = params["mood"]
-        merged_keys.append("mood")
-        state.emotion_vector = build_emotion_vector(str(params["mood"]))
+    # `emotion` is the single whole-session mood channel: a free-form label
+    # (sibling of `genre`) plus optional numeric `emotion_valence`/
+    # `emotion_arousal`. The numbers are the canonical "GPT emits numbers, not a
+    # label" lever (same pattern as the harmonizer op), so nuanced labels
+    # ("wistful") move the vector without a keyword table. A bare label that
+    # matches a preset also moves it; an unknown bare label leaves the existing
+    # vector untouched rather than clobbering it with a default.
     if "emotion" in params:
         state.user_params["emotion"] = params["emotion"]
         merged_keys.append("emotion")
-        # `emotion` is a free-form label from the parser; map to a vector when
-        # it happens to match a preset. Otherwise leave the existing vector
-        # alone — the harmonizer ops are the canonical valence/arousal lever.
-        state.emotion_vector = build_emotion_vector(str(params["emotion"]))
+    new_vector = _session_emotion_vector(state.emotion_vector, params)
+    if new_vector is not None:
+        state.emotion_vector = new_vector
+        state.emotion_source = "detected"
+        if "emotion" in params:
+            label = str(params["emotion"])
+            state.mood_label = label
+            # Mirror into user_params so explain.py (reads user_params["mood"])
+            # keeps resolving session_mood.
+            state.user_params["mood"] = label
 
     return OperationResult(
         target=op.target,
@@ -382,3 +394,32 @@ def _execute_session(state: SessionState, op: RefinementOp) -> OperationResult:
             "emotion_vector": state.emotion_vector.model_dump() if state.emotion_vector else None,
         },
     )
+
+
+def _session_emotion_vector(
+    current: EmotionVector | None,
+    params: dict[str, Any],
+) -> EmotionVector | None:
+    """Resolve a session op's new emotion vector, or ``None`` to leave it as-is.
+
+    Priority:
+      1. Numeric ``emotion_valence``/``emotion_arousal`` from the parser — the
+         canonical, GPT-inferred lever (nuanced labels still move the vector).
+         Either axis may be supplied; the missing one holds its current value.
+      2. A bare ``emotion`` label matching a curated preset (keyword-fallback
+         plans that carry no numbers).
+      3. Otherwise ``None`` — an unknown bare label must not clobber the vector.
+    """
+    has_valence = "emotion_valence" in params
+    has_arousal = "emotion_arousal" in params
+    if has_valence or has_arousal:
+        base = current or EmotionVector(valence=0.0, arousal=0.0)
+        valence = float(params["emotion_valence"]) if has_valence else base.valence
+        arousal = float(params["emotion_arousal"]) if has_arousal else base.arousal
+        return EmotionVector(
+            valence=_clip(valence, *_VALENCE_BOUNDS),
+            arousal=_clip(arousal, *_AROUSAL_BOUNDS),
+        )
+    if "emotion" in params:
+        return lookup_emotion_preset(str(params["emotion"]))
+    return None

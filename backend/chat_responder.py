@@ -43,13 +43,14 @@ def build_chat_reply(
     message: str,
     *,
     pipeline: GPTPipeline | None = None,
+    language: str | None = None,
 ) -> ChatReply:
     """Return a grounded assistant reply, falling back to the mock on any failure."""
     if pipeline is None:
         return _fallback(state, message, reason="no_gpt_pipeline")
 
     try:
-        result = pipeline.route_request("explain", state, message)
+        result = pipeline.route_request("explain", state, message, language=language)
     except Exception as exc:
         LOGGER.info(
             "chat_explain_gpt_failed",
@@ -74,6 +75,8 @@ def build_chat_reply(
         cache_hit=result.cache_hit,
         latency_ms=result.latency_ms,
         has_limits=bool(limits),
+        question=message,
+        answer_preview=answer[:120],
     )
     return ChatReply(
         message=ChatMessage(role="assistant", content=answer, timestamp=_now_iso()),
@@ -93,12 +96,21 @@ def _extract_answer_and_limits(parsed: Any, *, fallback_content: str) -> tuple[s
     but cached results round-trip through JSON so ``parsed`` may already be a
     dict, a JSON string, or — if the model returned plain prose — a
     ``{"text": "..."}`` envelope from the pipeline's text fallback.
+
+    A bare string that fails to parse is treated two ways: genuine prose is
+    surfaced as the answer, but a string that *looks* like it was meant to be
+    JSON (starts with ``{`` / ``[``) yet won't parse is a truncated/corrupt
+    payload — we return empty so the caller falls back to the mock rather than
+    showing the user a broken fragment dressed up as a real answer.
     """
     if isinstance(parsed, str):
         try:
             parsed = json.loads(parsed)
         except json.JSONDecodeError:
-            return parsed.strip(), None
+            stripped = parsed.strip()
+            if stripped[:1] in ("{", "["):
+                return "", None
+            return stripped, None
     if isinstance(parsed, dict):
         answer = parsed.get("answer")
         limits = parsed.get("limits")

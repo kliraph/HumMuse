@@ -1,28 +1,60 @@
-"""Deterministic mock generators used by the early session-centric API."""
+"""Deterministic GPT-down fallbacks for the session-centric API.
+
+Everything in this module is invoked only when the GPT pipeline is
+unavailable (no credentials, transport error, schema validation failure).
+Live production helpers - `add_history`, `append_chat_message`,
+`now_iso` - moved to `backend/history.py`.
+
+Functions kept here:
+
+* :func:`build_progressions`        - wrap chord-symbol lists into
+                                      :class:`Progression` objects with
+                                      placeholder scores. Used by
+                                      ``/melody/from-hum`` and ``/chords/from-lyrics``
+                                      when there is no melody to drive the
+                                      real DQN.
+* :func:`build_emotion_vector`      - 5-preset mood string ->
+                                      :class:`EmotionVector`. Currently the
+                                      only mood-to-vector adapter; live in
+                                      production until a real classifier
+                                      replaces it (planned).
+* :func:`build_lyric_suggestions`   - template-string interpolation;
+                                      fallback for
+                                      ``lyric_responder.generate_lyric_suggestions``.
+* :func:`build_chat_reply`          - explanation_report.summary +
+                                      chord-detail concatenation; fallback
+                                      for ``chat_responder.build_chat_reply``.
+* :func:`build_refinement_plan`     - bilingual (EN+RU) keyword heuristic;
+                                      fallback for
+                                      ``refinement_parser.parse_refinement_instruction``.
+"""
 
 from __future__ import annotations
 
-import re
-from datetime import UTC, datetime
 from typing import Iterable
 
-from ml.melody_sketchpad.notes import melody_notes_to_events, pitch_to_midi
+from ml.gpt.syllable import count_syllables
 from shared.schemas import (
-    Action,
     ChatMessage,
-    EmotionVector,
     LyricSuggestion,
-    MelodySuggestion,
-    NoteEvent,
     Progression,
     RefinementOp,
     RefinementPlan,
     SessionState,
 )
-from ml.melody_sketchpad.profile import build_melody_profile
+from backend.history import now_iso
 
-_WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?", re.IGNORECASE)
-_VOWEL_GROUP_RE = re.compile(r"[aeiouy]+", re.IGNORECASE)
+# The canonical mood/emotion taxonomy lives in shared.schemas so the backend
+# and ml layers share one definition. Re-exported here for backward
+# compatibility — existing callers (mood_responder, refinement_executor) import
+# these names from backend.mock_pipeline.
+from shared.schemas import (  # noqa: F401  (re-exported)
+    EMOTION_PRESET_LABELS,
+    _EMOTION_PRESETS,
+    build_emotion_vector,
+    lookup_emotion_preset,
+    normalize_mood_label,
+)
 
 
 def build_progressions(symbol_groups: Iterable[list[str]], mood: str) -> list[Progression]:
@@ -43,68 +75,6 @@ def build_progressions(symbol_groups: Iterable[list[str]], mood: str) -> list[Pr
             )
         )
     return progressions
-
-
-def build_emotion_vector(mood: str) -> EmotionVector:
-    presets = {
-        "joyful": EmotionVector(valence=0.8, arousal=0.7),
-        "uplift": EmotionVector(valence=0.7, arousal=0.6),
-        "melancholic": EmotionVector(valence=-0.5, arousal=0.2),
-        "tense": EmotionVector(valence=-0.3, arousal=0.8),
-        "neutral": EmotionVector(valence=0.0, arousal=0.3),
-    }
-    return presets.get(mood, EmotionVector(valence=0.1, arousal=0.4))
-
-
-def count_syllables(text: str) -> int:
-    return sum(_count_word_syllables(word) for word in _WORD_RE.findall(text))
-
-
-def _count_word_syllables(word: str) -> int:
-    cleaned = re.sub(r"[^a-z]", "", word.lower())
-    if not cleaned:
-        return 0
-    if len(cleaned) <= 3:
-        return 1
-
-    syllables = len(_VOWEL_GROUP_RE.findall(cleaned))
-    if cleaned.endswith("e") and not cleaned.endswith(("le", "ye")) and syllables > 1:
-        syllables -= 1
-    if cleaned.endswith(("es", "ed")) and not cleaned.endswith(("ted", "ded")) and syllables > 1:
-        syllables -= 1
-
-    return max(1, syllables)
-
-
-def build_melody_suggestions(state: SessionState, count: int = 3) -> list[MelodySuggestion]:
-    seed_notes = state.melody_notes or [
-        NoteEvent(pitch=60, onset=0.0, duration=1.0, velocity=96, confidence=0.9),
-        NoteEvent(pitch=64, onset=1.0, duration=1.0, velocity=98, confidence=0.9),
-        NoteEvent(pitch=67, onset=2.0, duration=1.0, velocity=100, confidence=0.9),
-    ]
-    last_onset = max(note.onset + note.duration for note in seed_notes)
-    suggestions: list[MelodySuggestion] = []
-    for index in range(count):
-        offset = index + 1
-        notes = [
-            NoteEvent(
-                pitch=min(127, note.pitch + offset),
-                onset=last_onset + idx,
-                duration=note.duration,
-                velocity=max(1, min(127, note.velocity - index)),
-                confidence=max(0.6, note.confidence - (index * 0.05)),
-            )
-            for idx, note in enumerate(seed_notes[-3:])
-        ]
-        suggestions.append(
-            MelodySuggestion(
-                midi_bytes=f"mock-midi-{state.session_id}-{index}".encode("utf-8"),
-                notes=notes,
-                explanation=f"Continuation {index + 1} mirrors the session contour with a {offset}-semitone lift.",
-                coherence_score=max(0.55, 0.9 - (index * 0.12)),
-            )
-        )
-    return suggestions
 
 
 def build_lyric_suggestions(state: SessionState, mode: str, count: int = 3) -> list[LyricSuggestion]:
@@ -230,20 +200,5 @@ def build_chat_reply(state: SessionState, message: str) -> ChatMessage:
     return ChatMessage(
         role="assistant",
         content=f"{summary} In response to '{message}', the stub explanation stays grounded in the current session data.{chord_detail}",
-        timestamp=_now_iso(),
+        timestamp=now_iso(),
     )
-
-
-def add_history(state: SessionState, kind: str, payload: dict[str, object], *, source: str = "api") -> SessionState:
-    state.history.append(Action(kind=kind, payload=payload, source=source))
-    return state
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def append_chat_message(state: SessionState, role: str, content: str) -> ChatMessage:
-    message = ChatMessage(role=role, content=content, timestamp=_now_iso())
-    state.chat_history.append(message)
-    return message

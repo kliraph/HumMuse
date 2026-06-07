@@ -182,12 +182,34 @@ def derive_chord_symbol(
 
 
 def parse_key(key: str | None) -> tuple[int, str]:
+    """Parse a key string into ``(tonic_pitch_class, mode)``.
+
+    Accepts both the canonical space-separated form emitted by
+    ``detect_key`` ("C major", "A minor") and compact forms that UI/LLM
+    callers may produce ("Am", "C#m", "Cmin", "C#minor", "Bbmaj"). The tonic
+    is the leading note letter plus an optional single accidental; whatever
+    follows (after an optional separating space) is the mode. Mode is minor
+    for the bare "m" suffix or any "min"/"minor" token; everything else
+    (incl. "maj"/"major", modal names, empty) is treated as major, matching
+    the prior behaviour. Unrecognised tonics fall back to pitch class 0 (C).
+    """
     if not key:
         return 0, "major"
-    parts = key.strip().split()
-    tonic = parts[0] if parts else "C"
-    mode = parts[1].lower() if len(parts) > 1 else "major"
-    return NAME_TO_PC.get(tonic, 0), "minor" if mode.startswith("min") else "major"
+
+    stripped = key.strip()
+    if not stripped:
+        return 0, "major"
+
+    # Split off the tonic: note letter + optional accidental (# or b).
+    tonic = stripped[0].upper()
+    rest = stripped[1:]
+    if rest[:1] in ("#", "b"):
+        tonic += rest[0]
+        rest = rest[1:]
+
+    mode_token = rest.strip().lower()
+    is_minor = mode_token == "m" or mode_token.startswith("min")
+    return NAME_TO_PC.get(tonic, 0), "minor" if is_minor else "major"
 
 
 def _candidate_readings(

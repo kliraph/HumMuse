@@ -11,10 +11,20 @@ import requests
 import streamlit as st
 
 try:
-    from ui.audio_utils import decode_midi_bytes, render_audio_from_session, synthesize_wave_from_notes
+    from ui.audio_utils import (
+        decode_midi_bytes,
+        render_audio_from_session,
+        synthesize_progression_audio,
+        synthesize_wave_from_notes,
+    )
     from ui.i18n import DEFAULT_LANGUAGE, LANGUAGES, t
 except ModuleNotFoundError:  # pragma: no cover - script execution fallback
-    from audio_utils import decode_midi_bytes, render_audio_from_session, synthesize_wave_from_notes
+    from audio_utils import (
+        decode_midi_bytes,
+        render_audio_from_session,
+        synthesize_progression_audio,
+        synthesize_wave_from_notes,
+    )
     from i18n import DEFAULT_LANGUAGE, LANGUAGES, t
 
 
@@ -23,25 +33,44 @@ SOUNDFONT_PATH = os.environ.get("HUMMUSE_SOUNDFONT", "")
 SUPPORTED_AUDIO_TYPES = ["wav", "webm", "mp3"]
 _PITCH_CLASS_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
-# Story Bible (creative-context graph) -----------------------------------
-# Centralized creative-intent fields that flow into downstream subsystems
-# (DQN chord head, transformer melody continuation, GPT lyric prompts).
-# Scope is deliberately narrow: only fields the backend actually consumes
-# today get a Story Bible widget. Genre / Theme / Vocabulary are not wired
-# end-to-end, so they are intentionally absent — the dependency graph
+# Song Brief (creative-context graph) ------------------------------------
+# The song-level emotional brief: the author's mood choice flows into
+# downstream subsystems (DQN chord head, transformer melody continuation,
+# GPT lyric prompts) via state.emotion_vector, persisted through
+# POST /session/mood. Scope is deliberately narrow: only fields the backend
+# actually consumes today get a widget. Genre / Theme / Vocabulary are not
+# wired end-to-end, so they are intentionally absent — the dependency graph
 # must remain honest, not aspirational.
+#
+# MOOD_OPTIONS is the offline fallback for the canonical mood taxonomy; the
+# live list is fetched from GET /moods (see fetch_mood_options). Keep this
+# mirror in sync with shared.schemas.EMOTION_PRESET_LABELS — a test pins it.
 MOOD_OPTIONS = [
+    "joyful",
+    "triumphant",
     "uplift",
-    "melancholy",
-    "tense",
-    "calm",
-    "energetic",
+    "hopeful",
     "romantic",
+    "calm",
+    "neutral",
+    "reflective",
+    "melancholic",
     "dark",
-    "playful",
+    "anxious",
+    "tense",
 ]
-DEFAULT_STORY_BIBLE: dict[str, Any] = {
-    "mood": "uplift",
+MOOD_DEFAULT = "uplift"
+# Legacy/aliased mood labels from older sessions/snapshots → canonical preset.
+MOOD_ALIASES = {"melancholy": "melancholic"}
+# Lyric generation styles. Values must match VALID_LYRIC_MODES in
+# ml/gpt/prompts/lyrics.py — the backend silently maps anything else
+# to "Poetic" (the default), which is exactly the bug a missing mode
+# selector produces. Keep this list synchronized if the backend grows
+# new modes.
+LYRIC_MODE_OPTIONS = ["Simpler", "Poetic", "Catchy"]
+LYRIC_MODE_DEFAULT = "Poetic"
+DEFAULT_SONG_BRIEF: dict[str, Any] = {
+    "mood": MOOD_DEFAULT,
 }
 
 
@@ -113,16 +142,15 @@ def extract_melody_from_audio(
     *,
     session_id: str,
     uploaded_audio: Any,
-    mood: str,
 ) -> dict[str, Any]:
     """POST audio to the melody-from-hum endpoint.
 
-    ``prompt`` and ``tempo_bpm`` were deliberately removed from the UI:
-    ``prompt`` was a no-op annotation, and ``tempo_bpm`` should be
-    detected from audio (the backend currently falls back to 100 BPM
-    when omitted — a real librosa beat-track is a backend follow-up).
-    The endpoint still accepts both as optional Form fields with
-    defaults, so omitting them here is non-breaking.
+    ``prompt``, ``tempo_bpm`` and ``mood`` are deliberately not sent:
+    ``prompt`` was a no-op annotation, ``tempo_bpm`` should be detected
+    from audio, and ``mood`` only nudged the *mock* melody's final pitch —
+    it is not the canonical emotion lever (that is the Song Brief →
+    state.emotion_vector path). The endpoint still accepts all three as
+    optional Form fields, so omitting them is non-breaking.
     """
     audio_file = build_audio_file_tuple(uploaded_audio)
     return api_post_multipart(
@@ -131,7 +159,6 @@ def extract_melody_from_audio(
         files={"audio": audio_file},
         data={
             "session_id": session_id,
-            "mood": mood,
         },
     )
 
@@ -154,6 +181,81 @@ def format_midi_pitch(midi_pitch: int) -> str:
     octave = (int(midi_pitch) // 12) - 1
     note_name = _PITCH_CLASS_NAMES[int(midi_pitch) % 12]
     return f"{note_name}{octave} ({int(midi_pitch)})"
+
+
+def _friendly_action_label(source_action: str) -> str:
+    """Translate a backend `source_action` slug to a human label.
+
+    Tries `t("explanations.action.<slug>")` first; if no translation
+    exists (i.e. t() returns the key unchanged — its loud-failure
+    behaviour), falls back to a cleaned-up display of the slug so
+    unknown actions still render readably instead of as `key.path`.
+    """
+    key = f"explanations.action.{source_action}"
+    label = t(key)
+    if label == key:
+        return source_action.replace("_", " ").capitalize()
+    return label
+
+
+def _short_model_label(model: str) -> str:
+    """Trim `gpt://<id>/<family>/<version>@<rev>` to `<family>/<version>`.
+
+    The full identifier is fine for audit logs but useless visually.
+    Defensive against unknown shapes — returns the original string with
+    revision lopped off if the pattern doesn't match.
+    """
+    base = model.split("@", 1)[0]
+    parts = [p for p in base.split("/") if p]
+    if len(parts) >= 2:
+        return "/".join(parts[-2:])
+    return base
+
+
+def normalize_mood(label: str | None) -> str | None:
+    """Map a mood label to a canonical preset, or ``None`` if unrecognised.
+
+    Mirrors ``shared.schemas.normalize_mood_label`` client-side (the UI cannot
+    import backend/shared). Applies known aliases (``melancholy`` →
+    ``melancholic``) and returns ``None`` for labels outside the fetched/known
+    taxonomy so the caller can fall back to a safe default.
+    """
+    if not label:
+        return None
+    canonical = MOOD_ALIASES.get(label, label)
+    return canonical if canonical in mood_options() else None
+
+
+def fetch_mood_options(api_base_url: str) -> list[str]:
+    """Return the canonical mood labels from the backend, cached per session.
+
+    Falls back to the mirrored ``MOOD_OPTIONS`` constant if the backend is
+    unreachable so the Song Brief still renders offline.
+    """
+    cached = st.session_state.get("mood_options")
+    if cached:
+        return cached
+    try:
+        labels = api_get(api_base_url, "/moods").get("labels") or []
+    except requests.RequestException:
+        labels = []
+    options = labels or list(MOOD_OPTIONS)
+    st.session_state["mood_options"] = options
+    return options
+
+
+def mood_options() -> list[str]:
+    """The currently-known mood labels (fetched cache or offline fallback)."""
+    return st.session_state.get("mood_options") or list(MOOD_OPTIONS)
+
+
+def set_session_mood(api_base_url: str, *, session_id: str, mood: str) -> dict[str, Any]:
+    """Persist an author-chosen Song Brief mood as the session emotion."""
+    return api_post(
+        api_base_url,
+        "/session/mood",
+        payload={"session_id": session_id, "mood": mood},
+    )
 
 
 def artifact_by_kind(artifacts: list[dict[str, Any]], kind: str) -> dict[str, Any] | None:
@@ -180,6 +282,27 @@ def generate_chords_from_lyrics(
         api_base_url,
         "/chords/from-lyrics",
         payload={"session_id": session_id, "text": lyrics_text},
+    )
+
+
+def generate_chords_from_melody(
+    api_base_url: str,
+    *,
+    session_id: str,
+    top_k: int = 3,
+) -> dict[str, Any]:
+    """Run the DQN harmonizer purely from the session melody.
+
+    Backend requires ``state.melody_notes`` to be populated (UI should
+    gate the button on it). ``emotion_vector`` is omitted so the
+    endpoint falls back to ``state.emotion_vector`` if present, else
+    the neutral default — exactly the contract documented on
+    ``/chords/from-melody``.
+    """
+    return api_post(
+        api_base_url,
+        "/chords/from-melody",
+        payload={"session_id": session_id, "top_k": top_k},
     )
 
 
@@ -253,15 +376,18 @@ def request_lyric_suggestions(
     api_base_url: str,
     *,
     session_id: str,
-    mode: str = "continue",
+    mode: str = LYRIC_MODE_DEFAULT,
     num_suggestions: int = 3,
     lyrics_text: str | None = None,
 ) -> dict[str, Any]:
     """Trigger lyric-suggestion generation.
 
-    ``lyrics_text`` is sent only when non-empty so older backends that
-    ignore unknown fields stay happy and we don't accidentally wipe
-    session state with an empty buffer from a stale text area.
+    Default ``mode`` matches the backend's silent fallback ("Poetic")
+    so callers that forget to pass one don't surprise the user with a
+    style they didn't ask for. ``lyrics_text`` is sent only when
+    non-empty so older backends that ignore unknown fields stay happy
+    and we don't accidentally wipe session state with an empty buffer
+    from a stale text area.
     """
     payload: dict[str, Any] = {
         "session_id": session_id,
@@ -292,33 +418,66 @@ def send_chat_message(
     *,
     session_id: str,
     message: str,
+    language: str | None = None,
 ) -> dict[str, Any]:
+    payload: dict[str, Any] = {"message": message}
+    if language:
+        payload["language"] = language
     return api_post(
         api_base_url,
         f"/session/{session_id}/chat",
-        payload={"message": message},
+        payload=payload,
     )
 
 
+def _compress_chord_sequence(chords: list[str], *, separator: str = " -> ") -> str:
+    """Run-length encode adjacent duplicate chord symbols.
+
+    ``["C", "C", "C", "F", "G"]`` → ``"C ×3 -> F -> G"``. Keeps the
+    progression title readable when the backend returns long runs of
+    the same chord (e.g. an 18-position DQN output of all "Caug")
+    instead of scaring the user with a wall of identical symbols.
+    Single occurrences render without the multiplier suffix.
+    """
+    if not chords:
+        return ""
+    parts: list[str] = []
+    prev = chords[0]
+    count = 1
+    for chord in chords[1:]:
+        if chord == prev:
+            count += 1
+            continue
+        parts.append(f"{prev} ×{count}" if count > 1 else prev)
+        prev = chord
+        count = 1
+    parts.append(f"{prev} ×{count}" if count > 1 else prev)
+    return separator.join(parts)
+
+
 def progression_title(progression: dict[str, Any]) -> str:
-    return " -> ".join(progression["chords"])
+    return _compress_chord_sequence(progression.get("chords") or [])
 
 
 def progression_caption(progression: dict[str, Any]) -> str:
+    """Short, user-facing summary of a progression — scores + function.
+
+    The verbose backend ``explanation`` field (rollout details, reward
+    breakdowns, DQN epoch tags, etc.) is intentionally excluded here.
+    It is technical audit data, not a card caption — it lives behind
+    the "Show technical details" expander in the chord card.
+    """
     model_confidence = progression.get("model_confidence", progression.get("score"))
     mood_alignment = progression.get("mood_alignment")
-    explanation = progression.get("explanation", "")
     harmonic_function = progression.get("harmonic_function")
-    if harmonic_function:
-        explanation = f"{harmonic_function} | {explanation}"
-    labels = []
+    labels: list[str] = []
     if model_confidence is not None:
-        labels.append(f"Model confidence: {model_confidence:.2f}")
+        labels.append(f"Model confidence: {float(model_confidence):.2f}")
     if mood_alignment is not None:
-        labels.append(f"Mood alignment: {mood_alignment:.2f}")
-    if not labels:
-        return explanation
-    return f"{' | '.join(labels)} | {explanation}"
+        labels.append(f"Mood alignment: {float(mood_alignment):.2f}")
+    if harmonic_function:
+        labels.append(str(harmonic_function))
+    return " | ".join(labels)
 
 
 def top_pitch_class_probs(distribution: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
@@ -332,37 +491,44 @@ def top_pitch_class_probs(distribution: dict[str, Any], limit: int = 5) -> list[
 
 
 def render_progression_details(progression: dict[str, Any]) -> None:
+    """Render the diagnostic detail for one progression.
+
+    Flattened — no inner expanders — because callers wrap this in an
+    outer "Show technical details" expander. Streamlit allows nested
+    expanders but they read poorly; one outer gate over plain headed
+    sections is cleaner.
+    """
     annotations = progression.get("chord_annotations", [])
     distributions = progression.get("native_distributions", [])
     if annotations:
-        with st.expander("Derived chord-symbol annotations", expanded=False):
-            for annotation in annotations:
-                st.markdown(
-                    f"**{annotation['position'] + 1}. {annotation['symbol']}** "
-                    f"({annotation['roman_numeral']}, {annotation['function_label']})"
-                )
-                st.caption(
-                    f"Alignment: {annotation['alignment_percentage']:.2f} | "
-                    f"{annotation['template_phrase']}"
-                )
-                strong_notes = annotation.get("strong_beat_notes", [])
-                if strong_notes:
-                    st.json(strong_notes)
+        st.markdown(f"**{t('chords.annotations_header')}**")
+        for annotation in annotations:
+            st.markdown(
+                f"**{annotation['position'] + 1}. {annotation['symbol']}** "
+                f"({annotation['roman_numeral']}, {annotation['function_label']})"
+            )
+            st.caption(
+                f"Alignment: {annotation['alignment_percentage']:.2f} | "
+                f"{annotation['template_phrase']}"
+            )
+            strong_notes = annotation.get("strong_beat_notes", [])
+            if strong_notes:
+                st.json(strong_notes)
     if distributions:
-        with st.expander("Chord head policy and Q-values", expanded=False):
-            for distribution in distributions:
-                policy = distribution.get("policy", distribution)
-                st.markdown(f"**Position {distribution['position'] + 1}**")
-                st.write(
-                    {
-                        "rest": policy.get("rest", {}),
-                        "octave": policy.get("octave", {}),
-                        "inversion": policy.get("inversion", {}),
-                        "q_margin": distribution.get("q_margin", {}),
-                        "emotion_bias": distribution.get("emotion_bias"),
-                        "top_pitch_classes": top_pitch_class_probs(distribution),
-                    }
-                )
+        st.markdown(f"**{t('chords.distributions_header')}**")
+        for distribution in distributions:
+            policy = distribution.get("policy", distribution)
+            st.markdown(f"**Position {distribution['position'] + 1}**")
+            st.write(
+                {
+                    "rest": policy.get("rest", {}),
+                    "octave": policy.get("octave", {}),
+                    "inversion": policy.get("inversion", {}),
+                    "q_margin": distribution.get("q_margin", {}),
+                    "emotion_bias": distribution.get("emotion_bias"),
+                    "top_pitch_classes": top_pitch_class_probs(distribution),
+                }
+            )
 
 
 def numbered_label(index: int, text: str) -> str:
@@ -399,10 +565,10 @@ def render_grid(
 
 def confidence_to_color(confidence: float) -> str:
     if confidence >= 0.85:
-        return "#d9f99d"
+        return "#54AC3C"
     if confidence >= 0.7:
-        return "#fde68a"
-    return "#fecaca"
+        return "#ead02d"
+    return "#e74f4f"
 
 
 def render_confidence_note_table(notes: list[dict[str, Any]]) -> None:
@@ -454,7 +620,7 @@ def ensure_session_defaults() -> None:
     st.session_state.setdefault("latest_melody_result", None)
     st.session_state.setdefault("latest_melody_timings", None)
     st.session_state.setdefault("snapshots", [])
-    st.session_state.setdefault("story_bible", copy.deepcopy(DEFAULT_STORY_BIBLE))
+    st.session_state.setdefault("song_brief", copy.deepcopy(DEFAULT_SONG_BRIEF))
     st.session_state.setdefault("language", DEFAULT_LANGUAGE)
 
 
@@ -471,12 +637,33 @@ def reset_history(initial_key: str, **kwargs: Any) -> None:
     timeline always has a base to roll back to.
     """
     st.session_state.snapshots = []
+    # Drop the version-slider's persisted selection. Its widget key holds a
+    # label string from the *previous* session's snapshots; if the new session
+    # later grows enough snapshots to re-render the slider, Streamlit would
+    # validate that stale label against the new options and raise
+    # StreamlitAPIException. Clearing it lets the slider fall back to its
+    # `value=options[-1]` default on next render.
+    st.session_state.pop("history_slider", None)
     push_snapshot(initial_key, **kwargs)
 
 
-def reset_story_bible() -> None:
-    """Reset Story Bible to defaults — called on session create/load."""
-    st.session_state.story_bible = copy.deepcopy(DEFAULT_STORY_BIBLE)
+def reset_song_brief() -> None:
+    """Reset the Song Brief to defaults — called on session create/load."""
+    st.session_state.song_brief = copy.deepcopy(DEFAULT_SONG_BRIEF)
+
+
+def reset_lyrics_input(state: dict[str, Any] | None) -> None:
+    """Seed the Lyrics tab text-area buffer from a (re)loaded session.
+
+    Streamlit ignores a widget's ``value=`` once its ``key`` already
+    exists in ``session_state`` (which it always does — we seed it in
+    ``ensure_session_defaults``). So pre-population has to happen by
+    writing the key directly, *before* the widget is instantiated —
+    same approach as ``reset_song_brief``/``reset_history`` on a
+    session change. Called on create/load/restore; in-session edits stay
+    sticky because nothing rewrites the key between those events.
+    """
+    st.session_state["lyrics_input"] = (state or {}).get("lyrics_text") or ""
 
 
 def push_snapshot(label_key: str, **kwargs: Any) -> None:
@@ -486,7 +673,7 @@ def push_snapshot(label_key: str, **kwargs: Any) -> None:
     artifact as it stood once an action completed. Slider semantics: the
     rightmost snapshot is always the current live state.
 
-    The Story Bible is captured alongside session state because creative
+    The Song Brief is captured alongside session state because creative
     intent is part of "the version" of the song — restoring an older
     artifact should also restore the creative context that produced it.
 
@@ -502,8 +689,8 @@ def push_snapshot(label_key: str, **kwargs: Any) -> None:
         "label_key": label_key,
         "label_kwargs": kwargs,
         "state": copy.deepcopy(state),
-        "story_bible": copy.deepcopy(
-            st.session_state.get("story_bible", DEFAULT_STORY_BIBLE)
+        "song_brief": copy.deepcopy(
+            st.session_state.get("song_brief", DEFAULT_SONG_BRIEF)
         ),
     }
     st.session_state.snapshots.append(snapshot)
@@ -573,7 +760,8 @@ def render_sidebar() -> None:
             st.session_state.active_session_id = state["session_id"]
             st.session_state.active_session_state = state
             clear_playback_cache()
-            reset_story_bible()
+            reset_song_brief()
+            reset_lyrics_input(state)
             reset_history("snapshot.initial")
             refresh_sessions(api_base_url)
             st.session_state.selected_session_label = next(
@@ -615,11 +803,13 @@ def render_sidebar() -> None:
         else:
             session_id = options[selected_label]
             try:
-                st.session_state.active_session_state = fetch_session_state(api_base_url, session_id)
+                loaded_state = fetch_session_state(api_base_url, session_id)
+                st.session_state.active_session_state = loaded_state
                 st.session_state.active_session_id = session_id
                 st.session_state.selected_session_label = selected_label
                 clear_playback_cache()
-                reset_story_bible()
+                reset_song_brief()
+                reset_lyrics_input(loaded_state)
                 reset_history("snapshot.loaded")
                 st.sidebar.success(t("sidebar.loaded_session", sid=session_id))
             except requests.RequestException as exc:
@@ -681,10 +871,14 @@ def render_history_panel() -> None:
         disabled=is_latest,
         help=t("history.restore_help"),
     ):
-        st.session_state.active_session_state = copy.deepcopy(selected["state"])
-        st.session_state.story_bible = copy.deepcopy(
-            selected.get("story_bible", DEFAULT_STORY_BIBLE)
+        restored_state = copy.deepcopy(selected["state"])
+        st.session_state.active_session_state = restored_state
+        # Read the new "song_brief" snapshot key, falling back to the pre-rename
+        # "story_bible" key so snapshots captured before the rename still restore.
+        st.session_state.song_brief = copy.deepcopy(
+            selected.get("song_brief", selected.get("story_bible", DEFAULT_SONG_BRIEF))
         )
+        reset_lyrics_input(restored_state)
         clear_playback_cache()
         push_snapshot(
             "snapshot.restored",
@@ -704,20 +898,21 @@ def render_header() -> None:
     st.caption(t("app.caption"))
 
 
-def build_story_bible_dot(bible: dict[str, Any]) -> str:
-    """Build a Graphviz DOT diagram of the Story Bible dependency graph.
+def build_song_brief_dot(brief: dict[str, Any]) -> str:
+    """Build a Graphviz DOT diagram of the Song Brief dependency graph.
 
     Nodes are colored by role: yellow for user-controlled creative
     intent, blue for fields auto-detected from the user's audio, green
     for generative subsystems that consume them. Edge labels name what
     flows along each edge — every edge corresponds to a real code path
-    in the repo:
+    in the repo. The Mood node is authoritative: picking a mood calls
+    POST /session/mood, which sets state.emotion_vector, and all three
+    subsystems already read that vector:
 
-        Mood -> DQN          → ml/harmony/emotion_modulation.py
-        Mood -> Transformer  → ml/melody_sketchpad/continuation/emotion_temperature.py
-        Mood -> GPT          → emotion_vector field in ml/gpt/prompts/lyrics.py
-        Lyrics -> Mood       → ml/lyrics_to_chords/mood.py (auto-detect)
-        Lyrics -> DQN        → ml/lyrics_to_chords/mapping.py (symbol seed)
+        Mood -> DQN          → POST /session/mood → state.emotion_vector → ml/harmony/emotion_modulation.py
+        Mood -> Transformer  → state.emotion_vector (arousal) → ml/melody_sketchpad/continuation/emotion_temperature.py
+        Mood -> GPT          → state.emotion_vector → emotion_vector field in ml/gpt/prompts/lyrics.py
+        Lyrics -> Mood       → backend/mood_responder.py (suggest, not override)
         Lyrics -> GPT        → previous_lyrics field in lyric prompt
         Key   -> Transformer → continuation constraints
         Tempo -> Transformer → continuation constraints
@@ -725,9 +920,9 @@ def build_story_bible_dot(bible: dict[str, Any]) -> str:
     Nothing aspirational lives here — the graph is the explainability
     contract.
     """
-    mood = bible.get("mood", "—")
+    mood = brief.get("mood", "—")
     return f"""
-    digraph StoryBible {{
+    digraph SongBrief {{
         rankdir=LR;
         node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10];
         edge [fontname="Helvetica", fontsize=9, color="#475569"];
@@ -745,11 +940,10 @@ def build_story_bible_dot(bible: dict[str, Any]) -> str:
         Transformer [label="Transformer melody\\ncontinuation", fillcolor="#d9f99d"];
         GPT         [label="GPT lyric\\nsuggestions",           fillcolor="#d9f99d"];
 
-        Mood   -> DQN         [label="emotion bias"];
-        Mood   -> Transformer [label="temperature"];
+        Mood   -> DQN         [label="emotion vector"];
+        Mood   -> Transformer [label="temperature (arousal)"];
         Mood   -> GPT         [label="emotion vector"];
-        Lyrics -> Mood        [style=dashed, label="auto-detect"];
-        Lyrics -> DQN         [label="symbol seed"];
+        Lyrics -> Mood        [style=dashed, label="auto-detect (suggestion)"];
         Lyrics -> GPT         [label="previous lyrics"];
         Key    -> Transformer [label="key constraint"];
         Tempo  -> Transformer [label="tempo constraint"];
@@ -757,48 +951,77 @@ def build_story_bible_dot(bible: dict[str, Any]) -> str:
     """
 
 
-def render_story_bible() -> None:
-    """Render the Story Bible panel: editable creative-intent fields,
+def render_song_brief() -> None:
+    """Render the Song Brief panel: the editable mood (creative intent),
     read-only detected fields, and a dependency graph showing which
     fields drive which subsystems.
 
-    Acts as the single source of truth for mood/genre/theme/vocabulary —
-    other tabs (e.g. melody extraction) read `st.session_state.story_bible`
-    instead of carrying duplicate widgets. Changes are captured in the
-    next version snapshot triggered by a real mutation, and restored
-    alongside the artifact when the user rolls back via the slider.
+    The mood is the single source of truth for the session's emotion:
+    selecting one calls POST /session/mood, which persists
+    state.emotion_vector server-side and marks it "authored". Changes are
+    captured in the next version snapshot and restored alongside the
+    artifact when the user rolls back via the slider.
     """
     state = st.session_state.active_session_state
     if not state:
         return
-    bible = st.session_state.story_bible
+    brief = st.session_state.song_brief
+    options = fetch_mood_options(DEFAULT_API_URL)
 
-    with st.expander(t("story.expander_title"), expanded=True):
-        st.caption(t("story.caption"))
+    with st.expander(t("brief.expander_title"), expanded=True):
+        st.caption(t("brief.caption"))
 
-        # Editable creative intent — scope limited to fields the backend
-        # actually consumes today. Values sent to the backend stay
-        # English; only the display label changes per language.
-        mood_index = MOOD_OPTIONS.index(bible["mood"]) if bible.get("mood") in MOOD_OPTIONS else 0
-        bible["mood"] = st.selectbox(
-            t("story.mood_label"),
-            options=MOOD_OPTIONS,
-            index=mood_index,
-            key="story_bible_mood",
-            format_func=lambda m: t(f"mood.{m}"),
-            help=t("story.mood_help"),
+        # Editable creative intent. Values sent to the backend stay English
+        # (the backend keys on them); only the display label changes per
+        # language. Unknown/legacy labels fall back to "neutral" rather than
+        # index 0 so a stale value degrades to "no signal".
+        current = normalize_mood(brief.get("mood")) or (
+            "neutral" if "neutral" in options else options[0]
         )
+        mood_index = options.index(current)
+        selected_mood = st.selectbox(
+            t("brief.mood_label"),
+            options=options,
+            index=mood_index,
+            key="song_brief_mood",
+            format_func=lambda m: t(f"mood.{m}"),
+            help=t("brief.mood_help"),
+        )
+        if selected_mood != current or brief.get("mood") != selected_mood:
+            brief["mood"] = selected_mood
+            # Persist as the authoritative session emotion. Only fire the call
+            # when the value actually changed from what the backend holds.
+            if selected_mood != state.get("mood_label"):
+                try:
+                    set_session_mood(
+                        DEFAULT_API_URL,
+                        session_id=state["session_id"],
+                        mood=selected_mood,
+                    )
+                    st.session_state.active_session_state = fetch_session_state(
+                        DEFAULT_API_URL, state["session_id"]
+                    )
+                    push_snapshot("snapshot.mood_set", mood=t(f"mood.{selected_mood}"))
+                except requests.RequestException as exc:
+                    st.error(t("brief.could_not_set_mood", err=exc))
+
+        # Provenance: authored (chosen here) vs detected (inferred from lyrics).
+        emotion_source = state.get("emotion_source")
+        if emotion_source == "authored":
+            st.caption(t("brief.mood_authored"))
+        elif emotion_source == "detected":
+            st.caption(t("brief.mood_detected"))
 
         # Read-only auto-detected fields
-        st.markdown(t("story.detected_header"))
+        st.markdown(t("brief.detected_header"))
         detected_key = state.get("detected_key") or "—"
         detected_tempo = state.get("detected_tempo")
         tempo_str = (
             f"{float(detected_tempo):.0f} BPM" if detected_tempo is not None else "—"
         )
         meta_a, meta_b = st.columns(2)
-        meta_a.metric(t("story.detected_key"), detected_key)
-        meta_b.metric(t("story.detected_tempo"), tempo_str)
+        meta_a.metric(t("brief.detected_key"), detected_key)
+        meta_b.metric(t("brief.detected_tempo"), tempo_str)
 
         # Dependency graph — the thesis-defensibility piece. Graph
         # contents stay English-labeled by design: the labels correspond
@@ -806,10 +1029,10 @@ def render_story_bible() -> None:
         # repo, so a translated graph would mislead an examiner reading
         # the source.
         # Streamlit forbids nested expanders, so use a bordered container.
-        st.markdown(f"**{t('story.graph_expander')}**")
+        st.markdown(f"**{t('brief.graph_expander')}**")
         with st.container(border=True):
-            st.caption(t("story.graph_caption"))
-            st.graphviz_chart(build_story_bible_dot(bible), use_container_width=True)
+            st.caption(t("brief.graph_caption"))
+            st.graphviz_chart(build_song_brief_dot(brief), use_container_width=True)
 
 
 def render_session_overview() -> None:
@@ -894,16 +1117,12 @@ def render_melody_tab() -> None:
         else:
             st.caption(t("melody.source_recording"))
 
-    current_mood = st.session_state.story_bible["mood"]
-    st.caption(t("melody.mood_caption", mood=t(f"mood.{current_mood}")))
-
     if st.button(t("melody.extract_button"), use_container_width=True, disabled=chosen_audio is None):
         try:
             response = extract_melody_from_audio(
                 DEFAULT_API_URL,
                 session_id=state["session_id"],
                 uploaded_audio=chosen_audio,
-                mood=st.session_state.story_bible["mood"],
             )
             st.session_state.latest_melody_result = response
             try:
@@ -929,10 +1148,17 @@ def render_melody_tab() -> None:
     else:
         st.write(t("melody.no_notes_yet"))
 
+    # melody_profile (pitch class histogram, interval distribution, contour
+    # stats) is internal data for downstream subsystems (DQN chord scoring,
+    # GPT lyric prompts). The user-relevant facts (key, tempo, notes) are
+    # already shown above and in the Story Bible. The raw profile lives
+    # behind a collapsed expander as an audit-trail affordance — same
+    # mental-model framing as the raw explanation report on the
+    # Explanations tab: "advanced/debug, click if curious".
     profile = state.get("melody_profile")
     if profile:
-        st.write(t("melody.profile_header"))
-        st.json(profile)
+        with st.expander(t("melody.show_profile"), expanded=False):
+            st.json(profile)
 
     latest_result = st.session_state.latest_melody_result
     if latest_result and latest_result.get("session_id") == state["session_id"]:
@@ -947,17 +1173,17 @@ def render_melody_tab() -> None:
         )
         summary_c.metric(t("melody.returned_notes"), len(latest_result.get("melody_notes", [])))
 
-        explanation = latest_result.get("explanation", [])
-        if explanation:
-            for part in explanation:
-                with st.container(border=True):
-                    st.markdown(f"**{part['title']}**")
-                    st.write(part["detail"])
-
+        # Surface only the *actionable* pipeline signal: a fallback was
+        # triggered, so the user should adjust their input. The happy
+        # path stays silent — the metrics above already say everything
+        # interesting. Contour / harmony explanations were hardcoded
+        # placeholder text and have been removed.
         timings = st.session_state.latest_melody_timings
-        if timings:
-            st.write(t("melody.pipeline_timings"))
-            st.json(timings)
+        metadata = (timings or {}).get("metadata", {})
+        if metadata.get("used_audio_fallback"):
+            st.warning(t("melody.fallback_decode"))
+        elif metadata.get("melody_source") == "pesto_rhythm_fallback":
+            st.warning(t("melody.fallback_rhythm"))
 
     if state.get("melody_midi") or state.get("melody_notes"):
         actions_left, actions_right = st.columns(2)
@@ -1104,45 +1330,130 @@ def render_chords_tab() -> None:
         st.write(t("chords.context_placeholder"))
         return
 
-    st.markdown(t("chords.generate_from_lyrics_header"))
-    # Lyrics input now lives in the Lyrics tab — single source of truth.
-    # Here we just show what the active session holds and gate chord
-    # generation on its presence. Empty state = clear pointer to the
-    # Lyrics tab rather than a stub-looking disabled text box.
+    # Two parallel chord-generation sources — pick whichever the
+    # session currently has material for. The buttons are gated on the
+    # required state so the user can't trigger a 422 (e.g. melody-DQN
+    # without an uploaded melody, or lyrics-DQN without lyrics).
     lyrics_in_state = (state.get("lyrics_text") or "").strip()
-    if lyrics_in_state:
-        st.markdown(t("chords.lyrics_preview_header"))
-        with st.container(border=True):
-            st.write(lyrics_in_state)
-    else:
-        st.info(t("chords.lyrics_empty_hint"))
+    melody_notes = state.get("melody_notes") or []
+    has_melody = len(melody_notes) > 0
 
-    if st.button(t("chords.generate_button"), use_container_width=True, disabled=not lyrics_in_state):
-        try:
-            response = generate_chords_from_lyrics(
-                DEFAULT_API_URL,
-                session_id=state["session_id"],
-                lyrics_text=lyrics_in_state,
-            )
-            st.session_state.active_session_state = fetch_session_state(
-                DEFAULT_API_URL,
-                state["session_id"],
-            )
-            state = st.session_state.active_session_state
-            push_snapshot(
-                "snapshot.generated_chords",
-                n=len(response["chord_progressions"]),
-                mood=response["mood"],
-            )
-            st.success(
-                t(
-                    "chords.generated_n",
+    lyrics_col, melody_col = st.columns(2)
+
+    with lyrics_col:
+        st.markdown(t("chords.from_lyrics_header"))
+        if lyrics_in_state:
+            with st.container(border=True):
+                st.write(lyrics_in_state)
+        else:
+            st.info(t("chords.lyrics_empty_hint"))
+
+        if st.button(
+            t("chords.from_lyrics_button"),
+            use_container_width=True,
+            disabled=not lyrics_in_state,
+            key="chords_from_lyrics_submit",
+        ):
+            try:
+                response = generate_chords_from_lyrics(
+                    DEFAULT_API_URL,
+                    session_id=state["session_id"],
+                    lyrics_text=lyrics_in_state,
+                )
+                st.session_state.active_session_state = fetch_session_state(
+                    DEFAULT_API_URL,
+                    state["session_id"],
+                )
+                state = st.session_state.active_session_state
+                push_snapshot(
+                    "snapshot.generated_chords",
                     n=len(response["chord_progressions"]),
                     mood=response["mood"],
                 )
+                st.success(
+                    t(
+                        "chords.generated_n",
+                        n=len(response["chord_progressions"]),
+                        mood=response["mood"],
+                    )
+                )
+                # Suggest-not-override: if the author's Song Brief mood was kept,
+                # stash the lyric-inferred mood so the affordance below can offer
+                # to adopt it. Survives the rerun via session_state.
+                if response.get("mood_suggestion_pending") and response.get("detected_mood"):
+                    st.session_state["pending_detected_mood"] = response["detected_mood"]
+                else:
+                    st.session_state.pop("pending_detected_mood", None)
+            except requests.RequestException as exc:
+                st.error(t("chords.could_not_generate", err=exc))
+
+        pending_mood = st.session_state.get("pending_detected_mood")
+        if pending_mood and normalize_mood(pending_mood):
+            canonical = normalize_mood(pending_mood)
+            st.info(t("chords.mood_suggested", mood=t(f"mood.{canonical}")))
+            if st.button(
+                t("chords.accept_detected_mood"),
+                key="accept_detected_mood",
+                use_container_width=True,
+            ):
+                try:
+                    set_session_mood(
+                        DEFAULT_API_URL,
+                        session_id=state["session_id"],
+                        mood=canonical,
+                    )
+                    st.session_state.song_brief["mood"] = canonical
+                    st.session_state.active_session_state = fetch_session_state(
+                        DEFAULT_API_URL, state["session_id"]
+                    )
+                    st.session_state.pop("pending_detected_mood", None)
+                    push_snapshot("snapshot.mood_set", mood=t(f"mood.{canonical}"))
+                    st.rerun()
+                except requests.RequestException as exc:
+                    st.error(t("brief.could_not_set_mood", err=exc))
+
+    with melody_col:
+        st.markdown(t("chords.from_melody_header"))
+        if has_melody:
+            detected_key = state.get("detected_key") or t("melody.unknown")
+            st.caption(
+                t(
+                    "chords.melody_notes_preview",
+                    n=len(melody_notes),
+                    key=detected_key,
+                )
             )
-        except requests.RequestException as exc:
-            st.error(t("chords.could_not_generate", err=exc))
+        else:
+            st.info(t("chords.melody_empty_hint"))
+
+        if st.button(
+            t("chords.from_melody_button"),
+            use_container_width=True,
+            disabled=not has_melody,
+            key="chords_from_melody_submit",
+        ):
+            try:
+                response = generate_chords_from_melody(
+                    DEFAULT_API_URL,
+                    session_id=state["session_id"],
+                )
+                st.session_state.active_session_state = fetch_session_state(
+                    DEFAULT_API_URL,
+                    state["session_id"],
+                )
+                state = st.session_state.active_session_state
+                push_snapshot(
+                    "snapshot.generated_chords_from_melody",
+                    n=len(response["chord_progressions"]),
+                )
+                st.success(
+                    t(
+                        "chords.generated_from_melody_n",
+                        n=len(response["chord_progressions"]),
+                    )
+                )
+            except requests.RequestException as exc:
+                st.error(t("chords.could_not_generate_from_melody", err=exc))
 
     st.markdown("---")
     st.markdown(t("chords.manual_header"))
@@ -1190,8 +1501,64 @@ def render_chords_tab() -> None:
             with st.container(border=True):
                 st.markdown(t("chords.variant_label", n=index + 1))
                 st.markdown(progression_title(progression))
-                st.caption(progression_caption(progression))
-                render_progression_details(progression)
+
+                # Audio preview — synthesize the progression so the user
+                # can actually hear it. Consecutive duplicate chords are
+                # collapsed at the audio level too (a "Caug ×18" card
+                # plays one Caug, not 40 seconds of the same chord).
+                # Tempo follows the detected BPM so the preview lines up
+                # with what the melody would sound at.
+                chords_for_audio = progression.get("chords") or []
+                if chords_for_audio:
+                    try:
+                        preview_bpm = float(state.get("detected_tempo") or 100.0)
+                        st.audio(
+                            synthesize_progression_audio(
+                                chords_for_audio,
+                                bpm=preview_bpm,
+                            ),
+                            format="audio/wav",
+                        )
+                    except Exception:
+                        # Silent degrade: unknown chord symbol, empty
+                        # sequence, etc. The card stays usable; the user
+                        # just doesn't get a preview for this variant.
+                        pass
+
+                # Score badges — same st.metric pattern as melody cards.
+                score_cols = st.columns(2)
+                model_confidence = progression.get(
+                    "model_confidence", progression.get("score")
+                )
+                mood_alignment = progression.get("mood_alignment")
+                if model_confidence is not None:
+                    score_cols[0].metric(
+                        t("chords.model_confidence"),
+                        f"{float(model_confidence):.2f}",
+                    )
+                if mood_alignment is not None:
+                    score_cols[1].metric(
+                        t("chords.mood_alignment"),
+                        f"{float(mood_alignment):.2f}",
+                    )
+                harmonic_function = progression.get("harmonic_function")
+                if harmonic_function:
+                    st.caption(
+                        f"**{t('chords.harmonic_function')}:** {harmonic_function}"
+                    )
+
+                # All technical detail under one collapsed expander —
+                # consistent with the "Show melody profile (advanced)"
+                # and "Show raw report (advanced)" pattern elsewhere.
+                explanation_text = (progression.get("explanation") or "").strip()
+                annotations = progression.get("chord_annotations") or []
+                distributions = progression.get("native_distributions") or []
+                if explanation_text or annotations or distributions:
+                    with st.expander(t("chords.show_technical"), expanded=False):
+                        if explanation_text:
+                            st.caption(explanation_text)
+                        render_progression_details(progression)
+
                 if st.button(
                     t("chords.use_progression"),
                     key=f"accept_progression_{index}",
@@ -1238,16 +1605,31 @@ def render_lyrics_tab() -> None:
         st.write(t("lyrics.placeholder"))
         return
 
-    # Pre-populate from session state on first render of a session; the
-    # widget's `key` keeps the user's edits sticky across reruns.
-    existing_lyrics = state.get("lyrics_text") or ""
+    # The buffer is pre-seeded from `state.lyrics_text` on session
+    # create/load/restore (see `reset_lyrics_input`); the widget's `key`
+    # keeps the user's edits sticky across reruns. We must NOT pass
+    # `value=` here — Streamlit ignores it once the key exists and would
+    # emit a double-source warning.
     lyrics_text = st.text_area(
         t("lyrics.input_label"),
-        value=existing_lyrics if not st.session_state.lyrics_input else None,
         key="lyrics_input",
         height=200,
         placeholder=t("lyrics.input_placeholder"),
         help=t("lyrics.input_help"),
+    )
+
+    # Style picker — closed taxonomy matching backend's VALID_LYRIC_MODES.
+    # Values stay English (backend keys on them); only the display goes
+    # through t(). Defaulting to Poetic matches the backend's silent
+    # fallback so the visible selection always agrees with what runs.
+    mode_col, _ = st.columns([1, 2])
+    selected_mode = mode_col.selectbox(
+        t("lyrics.mode_label"),
+        options=LYRIC_MODE_OPTIONS,
+        index=LYRIC_MODE_OPTIONS.index(LYRIC_MODE_DEFAULT),
+        key="lyric_mode",
+        format_func=lambda m: t(f"lyric_mode.{m}"),
+        help=t("lyrics.mode_help"),
     )
 
     if st.button(
@@ -1260,6 +1642,7 @@ def render_lyrics_tab() -> None:
                 DEFAULT_API_URL,
                 session_id=state["session_id"],
                 lyrics_text=lyrics_text,
+                mode=selected_mode,
             )
             st.session_state.active_session_state = fetch_session_state(
                 DEFAULT_API_URL,
@@ -1281,10 +1664,18 @@ def render_lyrics_tab() -> None:
             with st.container(border=True):
                 st.markdown(t("chords.variant_label", n=index + 1))
                 st.write(suggestion["text"])
+                # Translate the mode value through the same dict the
+                # dropdown uses, so the caption matches the picker
+                # regardless of language. Fall back to the raw value if
+                # the model returned an unknown mode (defensive — the
+                # caption stays readable rather than printing a key).
+                raw_mode = str(suggestion.get("mode") or LYRIC_MODE_DEFAULT)
+                mode_key = f"lyric_mode.{raw_mode}"
+                mode_display = t(mode_key) if mode_key != t(mode_key) else raw_mode
                 st.caption(
                     t(
                         "suggestions.lyric_caption",
-                        mode=suggestion["mode"],
+                        mode=mode_display,
                         syllables=suggestion["syllable_count"],
                     )
                 )
@@ -1307,14 +1698,60 @@ def render_explanations_tab() -> None:
         st.write(t("explanations.placeholder"))
         return
 
-    report_column, chat_column = st.columns(2)
+    # Chat on the left, structured report on the right — chat is the
+    # active user surface, the report is reference material.
+    chat_column, report_column = st.columns(2)
     explanation_report = state.get("explanation_report")
 
     with report_column:
         st.markdown(t("explanations.xai_header"))
         if explanation_report:
-            st.caption(explanation_report.get("summary", ""))
-            st.json(explanation_report)
+            # Friendly summary as primary content. The structured fields
+            # under it (constraint_logs, melody_confidence, cache_status …)
+            # are diagnostic data, not user-facing copy — they belong
+            # behind an audit-trail expander, not in the main view.
+            summary = (explanation_report.get("summary") or "").strip()
+            if summary:
+                st.write(summary)
+
+            # Provenance line: what just ran + which model + cache state.
+            # Built defensively so missing pieces just shrink the line
+            # rather than blanking it.
+            badges: list[str] = []
+            source_action = explanation_report.get("source_action")
+            if source_action:
+                badges.append(
+                    f"**{t('explanations.action_label')}:** "
+                    f"{_friendly_action_label(str(source_action))}"
+                )
+            cache_status = explanation_report.get("cache_status") or {}
+            use_case = cache_status.get("use_case")
+            if use_case:
+                model = cache_status.get(f"last_{use_case}_model_version")
+                cache_hit = cache_status.get(f"last_{use_case}_cache_hit")
+                if model:
+                    badges.append(
+                        f"**{t('explanations.model_label')}:** "
+                        f"{_short_model_label(str(model))}"
+                    )
+                if cache_hit is not None:
+                    cache_label = (
+                        t("explanations.cache_hit")
+                        if cache_hit
+                        else t("explanations.cache_miss")
+                    )
+                    badges.append(
+                        f"**{t('explanations.cache_label')}:** {cache_label}"
+                    )
+            if badges:
+                st.caption(" · ".join(badges))
+
+            # Raw report kept available for thesis-defense moments
+            # ("show me the audit trail"). Collapsed by default — the
+            # expander reads as "advanced/debug", which is the right
+            # mental model for internal structured data.
+            with st.expander(t("explanations.show_raw_report"), expanded=False):
+                st.json(explanation_report)
         else:
             st.caption(t("explanations.no_report"))
 
@@ -1330,6 +1767,11 @@ def render_explanations_tab() -> None:
         else:
             st.caption(t("explanations.placeholder_ask"))
 
+        # Streamlit forbids writing to a widget-bound key after the widget
+        # is instantiated, so apply any pending clear *before* creating it.
+        if st.session_state.pop("_clear_explanations_chat_text", False):
+            st.session_state["explanations_chat_text"] = ""
+
         prompt = st.text_input(
             t("explanations.input_label"),
             key="explanations_chat_text",
@@ -1341,13 +1783,18 @@ def render_explanations_tab() -> None:
                     DEFAULT_API_URL,
                     session_id=state["session_id"],
                     message=prompt.strip(),
+                    language=LANGUAGES.get(
+                        st.session_state.get("language", DEFAULT_LANGUAGE),
+                        LANGUAGES[DEFAULT_LANGUAGE],
+                    ),
                 )
                 st.session_state.active_session_state = fetch_session_state(
                     DEFAULT_API_URL,
                     state["session_id"],
                 )
-                st.session_state.explanations_chat_text = ""
+                st.session_state["_clear_explanations_chat_text"] = True
                 st.success(t("explanations.replied"))
+                st.rerun()
             except requests.RequestException as exc:
                 st.error(t("explanations.could_not_send", err=exc))
 
@@ -1410,7 +1857,7 @@ def main() -> None:
             st.error(t("main.could_not_refresh", err=exc))
 
     render_session_overview()
-    render_story_bible()
+    render_song_brief()
     melody_tab, chords_tab, lyrics_tab, explanations_tab = st.tabs(
         [t("tab.melody"), t("tab.chords"), t("tab.lyrics"), t("tab.explanations")]
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 import time
 from io import BytesIO
 
@@ -12,6 +13,8 @@ from midiutil import MIDIFile
 
 from backend.api_models import (
     ArtifactListingResponse,
+    ChordsFromMelodyRequest,
+    ChordsFromMelodyResponse,
     ChordsManualRequest,
     ChordsManualResponse,
     LyricsToChordsRequest,
@@ -24,11 +27,11 @@ from backend.api_models import (
     SessionChatRequest,
     SessionChatResponse,
     SessionCreateRequest,
+    SessionMoodRequest,
+    SessionMoodResponse,
     SessionStateResponse,
     SuggestLyricsRequest,
     SuggestLyricsResponse,
-    WriterBlockHelpRequest,
-    WriterBlockHelpResponse,
 )
 from backend.database import Database
 from backend.experiment_logger import ExperimentLogger
@@ -40,25 +43,34 @@ from backend.logging_config import (
 )
 from backend.chat_responder import build_chat_reply
 from backend.explain import build_explanation_report
+from backend.history import add_history, append_chat_message
 from backend.lyric_responder import generate_lyric_suggestions
 from backend.mock_pipeline import (
-    add_history,
-    append_chat_message,
     build_emotion_vector,
     build_progressions,
 )
+from backend.mood_responder import infer_mood
 from backend.refinement_executor import execute_refinement_plan
 from backend.refinement_parser import parse_refinement_instruction
 from backend.session import SessionManager, SessionNotFoundError
 from ml.gpt.pipeline import GPTPipeline, ResponseCache
 from ml.harmony import generate_chords as generate_dqn_chords
+from ml.harmony.quantize import notes_to_harmony_grid
 from ml.melody_sketchpad.continuation.constraints import chord_symbol_to_pitch_classes
-from ml.lyrics_to_chords.service import generate_from_lyrics
 from ml.melody_sketchpad.continuation.pipeline import continue_melody as run_continuation_pipeline
 from ml.melody_sketchpad.pipeline import NoMelodyDetectedError, run_melody_pipeline
 from ml.melody_sketchpad.profile import build_melody_profile
-from ml.writers_block.service import generate_help
-from shared.schemas import ChordProgression, MelodySuggestion, NoteEvent, SessionState, SessionSummary
+from shared.schemas import (
+    EMOTION_PRESET_LABELS,
+    ChordProgression,
+    EmotionVector,
+    ExplanationPart,
+    MelodySuggestion,
+    NoteEvent,
+    SessionState,
+    SessionSummary,
+    lookup_emotion_preset,
+)
 
 APP_VERSION = "0.3.0"
 
@@ -69,22 +81,56 @@ experiment_logger = ExperimentLogger()
 request_logger = get_logger("backend.api")
 
 _gpt_pipeline: GPTPipeline | None = None
-_gpt_pipeline_init_failed: bool = False
+_gpt_pipeline_last_failure_at: float | None = None
+# How long to wait after a failed init before retrying. `from_env` only reads
+# `.env`/process env (no network), so the usual failure is a missing or
+# late-provisioned credential — a short cooldown lets the server recover once
+# the env is fixed, without restarting, while avoiding a retry storm on every
+# request. Override via HUMMUSE_GPT_INIT_RETRY_SECONDS (0 disables the cooldown).
+_GPT_INIT_RETRY_SECONDS = 60.0
+
+
+def _gpt_init_retry_seconds() -> float:
+    raw = os.getenv("HUMMUSE_GPT_INIT_RETRY_SECONDS")
+    if raw is None:
+        return _GPT_INIT_RETRY_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return _GPT_INIT_RETRY_SECONDS
 
 
 def _get_gpt_pipeline() -> GPTPipeline | None:
-    """Lazily construct a shared GPTPipeline; return None if config is missing."""
-    global _gpt_pipeline, _gpt_pipeline_init_failed
+    """Lazily construct a shared GPTPipeline; return None if config is missing.
+
+    A failed init is remembered with a timestamp rather than latched
+    permanently: subsequent calls reuse the "unavailable" verdict only until
+    the retry cooldown elapses, then attempt construction again so a corrected
+    credential recovers without a process restart.
+    """
+    global _gpt_pipeline, _gpt_pipeline_last_failure_at
     if _gpt_pipeline is not None:
         return _gpt_pipeline
-    if _gpt_pipeline_init_failed:
-        return None
+    if _gpt_pipeline_last_failure_at is not None:
+        cooldown = _gpt_init_retry_seconds()
+        if cooldown > 0.0 and (time.monotonic() - _gpt_pipeline_last_failure_at) < cooldown:
+            return None
     try:
         _gpt_pipeline = GPTPipeline.from_env(cache=ResponseCache(database))
     except Exception as exc:
-        request_logger.info("gpt_pipeline_init_failed", error=str(exc), error_type=exc.__class__.__name__)
-        _gpt_pipeline_init_failed = True
+        _gpt_pipeline_last_failure_at = time.monotonic()
+        # `.error` (not `.info`): GPT being unavailable silently degrades every
+        # GPT-backed endpoint to the mock, which is worth surfacing loudly. Use
+        # error rather than warning because the structured-logger fallback
+        # (_FallbackLogger) only implements info/error.
+        request_logger.error(
+            "gpt_pipeline_init_failed",
+            error=str(exc),
+            error_type=exc.__class__.__name__,
+            retry_after_seconds=_gpt_init_retry_seconds(),
+        )
         return None
+    _gpt_pipeline_last_failure_at = None
     return _gpt_pipeline
 
 
@@ -97,7 +143,7 @@ def _infer_pipeline_stage(endpoint: str) -> str:
         return "melody"
     if endpoint.startswith("/chords/"):
         return "harmony"
-    if endpoint.startswith("/suggest/") or endpoint.startswith("/writerblock/"):
+    if endpoint.startswith("/suggest/"):
         return "lyrics"
     if endpoint.startswith("/artifact/"):
         return "storage"
@@ -274,7 +320,6 @@ async def melody_from_hum(
         note_events = melody_result.note_events
         melody_profile = melody_result.melody_profile
         detected_tempo = melody_result.detected_tempo
-        chord_progressions = build_progressions([[chord.symbol for chord in melody_result.chords]], mood or "uplift")
         base_url = str(request.base_url).rstrip("/")
 
         midi_ref = experiment_logger.log_artifact(
@@ -282,13 +327,6 @@ async def melody_from_hum(
             kind="midi",
             filename="melody.mid",
             payload=melody_result.midi_bytes,
-            base_url=base_url,
-        )
-        chord_ref = experiment_logger.log_artifact(
-            run_id,
-            kind="chords",
-            filename="chords.json",
-            payload={"chords": [c.model_dump() for c in melody_result.chords]},
             base_url=base_url,
         )
         timing_ref = experiment_logger.log_artifact(
@@ -310,7 +348,9 @@ async def melody_from_hum(
         state.melody_profile = melody_profile
         state.detected_key = melody_result.detected_key
         state.detected_tempo = detected_tempo
-        state.chord_progressions = chord_progressions
+        # Chord generation is intentionally not coupled to melody upload —
+        # callers invoke /chords/from-melody or /chords/from-lyrics explicitly
+        # so they control when the DQN runs (and which emotion drives it).
         add_history(
             state,
             "melody_uploaded",
@@ -345,75 +385,331 @@ async def melody_from_hum(
             melody_profile=melody_profile,
             detected_key=state.detected_key,
             detected_tempo=detected_tempo,
-            chord_progressions=chord_progressions,
-            artifacts=[midi_ref, chord_ref, timing_ref],
+            artifacts=[midi_ref, timing_ref],
             run_id=run_id,
             explanation=melody_result.explanation,
         )
     except NoMelodyDetectedError as exc:
         experiment_logger.finish_run(run_id, error=exc)
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        # e.g. the 404 from _get_session_or_404, raised after the run has
+        # already been finished successfully. Propagate the real status code
+        # unchanged instead of letting the broad handler relabel it as a
+        # failed 500 run (which would also double-finish the run).
+        raise
     except Exception as exc:  # pragma: no cover
         experiment_logger.finish_run(run_id, error=exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+_NO_MELODY_FALLBACK_MAJOR = ["C", "G", "Am", "F"]
+_NO_MELODY_FALLBACK_MINOR = ["Am", "F", "C", "G"]
+
+
 @app.post("/chords/from-lyrics", response_model=LyricsToChordsResponse)
 def chords_endpoint(request: Request, payload: LyricsToChordsRequest) -> LyricsToChordsResponse:
-    mood, top_progressions, explanation = generate_from_lyrics(payload.text)
+    """Generate chords from lyrics.
+
+    Pipeline: lyrics → GPT mood inference (emotion vector + free-form,
+    language-matched mood label) → DQN harmonizer over the session
+    melody. Falls back to the keyword-bucket mood classifier when GPT is
+    unavailable; falls back to a fixed two-progression library when the
+    session has no melody (DQN cannot run without one).
+    """
     bind_request_context(
         request,
         session_id=str(payload.session_id) if payload.session_id is not None else None,
         pipeline_stage="harmony",
     )
+
+    mood_result = infer_mood(payload.text, pipeline=_get_gpt_pipeline())
+    emotion_vector = mood_result.emotion_vector
+    mood_label = mood_result.mood_label
+
+    explanation: list[ExplanationPart] = [
+        ExplanationPart(
+            title="Mood inference",
+            detail=(
+                f"{'GPT' if mood_result.source == 'gpt' else 'Keyword fallback'} "
+                f"read the lyrics as \"{mood_label}\" "
+                f"(valence={emotion_vector.valence:+.2f}, arousal={emotion_vector.arousal:+.2f})."
+            ),
+        ),
+    ]
+    if mood_result.rationale:
+        explanation.append(ExplanationPart(title="Why", detail=mood_result.rationale))
+
+    response_mood = mood_label
+    detected_mood: str | None = None
+    detected_emotion_vector: EmotionVector | None = None
+    mood_overridden = False
+    mood_suggestion_pending = False
+
     if payload.session_id is not None:
         state = _get_session_or_404(str(payload.session_id))
-        emotion_vector = build_emotion_vector(mood)
-        chord_progressions = _generate_chord_progressions_for_state(state, mood, top_progressions, emotion_vector)
+        # Always record what inference saw, regardless of whether it's applied.
+        state.user_params["last_mood_source"] = mood_result.source
+        state.user_params["last_mood_label"] = mood_label
+        state.user_params["last_mood_cache_hit"] = mood_result.cache_hit
+        state.user_params["last_mood_error"] = mood_result.error
+
+        authored = state.emotion_source == "authored" and state.emotion_vector is not None
+        if authored:
+            # Suggest, don't override: keep the author's Song Brief mood and
+            # generate from it; surface the lyric-inferred mood as a suggestion.
+            active_vector = state.emotion_vector
+            response_mood = state.mood_label or mood_label
+            detected_mood = mood_label
+            detected_emotion_vector = emotion_vector
+            mood_suggestion_pending = True
+            state.user_params["suggested_mood_label"] = mood_label
+            state.user_params["suggested_mood_valence"] = emotion_vector.valence
+            state.user_params["suggested_mood_arousal"] = emotion_vector.arousal
+            chord_progressions = _generate_chord_progressions_for_state(state, active_vector)
+            explanation.append(
+                ExplanationPart(
+                    title="Kept your Song Brief mood",
+                    detail=(
+                        f"Detected mood '{mood_label}' is offered as a suggestion; your "
+                        f"chosen Song Brief mood '{response_mood}' drives the harmony."
+                    ),
+                )
+            )
+            summary = (
+                f"Lyrics read as '{mood_label}', but your Song Brief mood "
+                f"'{response_mood}' was kept; DQN harmonizer produced "
+                f"{len(chord_progressions)} progression candidate(s)."
+            )
+        else:
+            # No authored mood — apply the inferred mood as the session emotion.
+            mood_overridden = True
+            active_vector = emotion_vector
+            state.emotion_vector = emotion_vector
+            state.mood_label = mood_label
+            state.emotion_source = "detected"
+            state.user_params["mood"] = mood_label
+            chord_progressions = _generate_chord_progressions_for_state(state, active_vector)
+            summary = (
+                f"Lyric analysis inferred mood '{mood_label}' "
+                f"(v={emotion_vector.valence:+.2f}, a={emotion_vector.arousal:+.2f}); "
+                f"DQN harmonizer produced {len(chord_progressions)} progression candidate(s)."
+            )
+
         state.lyrics_text = payload.text
-        state.emotion_vector = emotion_vector
         state.chord_progressions = chord_progressions
         add_history(
             state,
             "lyrics_analysed",
             {
-                "mood": mood,
-                "source": "dqn" if state.melody_notes else "mock",
+                "mood_label": mood_label,
+                "mood_source": mood_result.source,
+                "valence": emotion_vector.valence,
+                "arousal": emotion_vector.arousal,
+                "harmonizer": "dqn" if state.melody_notes else "fallback",
+                "mode": "suggested" if mood_suggestion_pending else "applied",
                 "progression_count": len(chord_progressions),
             },
         )
         _update_explanation_report(
             state,
             source_action="chords_from_lyrics",
-            summary="Lyric analysis produced emotion-conditioned DQN chord progression candidates.",
+            summary=summary,
         )
         _save_session(state)
-        top_progressions = [progression.chords for progression in chord_progressions]
+        top_progressions = [list(progression.chords) for progression in chord_progressions]
     else:
-        chord_progressions = build_progressions(top_progressions, mood)
+        chord_progressions = _build_no_melody_fallback_progressions(emotion_vector, mood_label)
+        top_progressions = [list(progression.chords) for progression in chord_progressions]
+        mood_overridden = True
+
     return LyricsToChordsResponse(
-        mood=mood,
+        mood=response_mood,
         top_progressions=top_progressions,
         chord_progressions=chord_progressions,
         explanation=explanation,
         session_id=payload.session_id,
+        detected_mood=detected_mood,
+        detected_emotion_vector=detected_emotion_vector,
+        mood_overridden=mood_overridden,
+        mood_suggestion_pending=mood_suggestion_pending,
     )
 
 
-def _generate_chord_progressions_for_state(
-    state: SessionState,
-    mood: str,
-    fallback_progressions: list[list[str]],
-    emotion_vector,
-) -> list:
+def _generate_chord_progressions_for_state(state: SessionState, emotion_vector) -> list:
     if not state.melody_notes:
-        return build_progressions(fallback_progressions, mood)
-    return generate_dqn_chords(
-        state.melody_notes,
+        # No melody to drive the DQN — return the two-progression fallback
+        # library shaped by the emotion vector's sign.
+        return _build_no_melody_fallback_progressions(emotion_vector, mood_label_hint=None)
+    # Snap a throwaway copy of the melody onto a beat grid for the chord model
+    # only. The melody artifact the user keeps stays unquantized; this restores
+    # the clean bar_position / duration_type channel the DQN needs so hummed
+    # rubato does not collapse chord output. See ml/harmony/quantize.py.
+    progressions = generate_dqn_chords(
+        notes_to_harmony_grid(state.melody_notes),
         key=state.detected_key or "C major",
         emotion_vector=emotion_vector,
         top_k=3,
         tempo_bpm=state.detected_tempo or 120.0,
+    )
+    if not progressions:
+        # The melody had notes but produced no usable chord events (e.g. all
+        # rests/filtered by notes_to_events). Treat it like the no-melody case
+        # so the response still satisfies the fixed 3-progression contract on
+        # LyricsToChordsResponse.top_progressions instead of raising a 500.
+        return _build_no_melody_fallback_progressions(emotion_vector, mood_label_hint=None)
+    return progressions
+
+
+def _build_no_melody_fallback_progressions(emotion_vector, mood_label_hint: str | None) -> list:
+    """Two fixed progressions chosen by valence sign, returned with a
+    transparent "fallback" explanation so callers know the DQN didn't run.
+    """
+    symbols = (
+        _NO_MELODY_FALLBACK_MAJOR
+        if emotion_vector.valence >= 0
+        else _NO_MELODY_FALLBACK_MINOR
+    )
+    return build_progressions(
+        [symbols, list(reversed(symbols)), symbols],
+        mood_label_hint or "neutral",
+    )
+
+
+@app.post("/chords/from-melody", response_model=ChordsFromMelodyResponse)
+def chords_from_melody_endpoint(request: Request, payload: ChordsFromMelodyRequest) -> ChordsFromMelodyResponse:
+    """Run the DQN harmonizer over the session melody without any lyric input.
+
+    Requires ``state.melody_notes``; returns 422 if the session has no melody.
+    Emotion source priority: request body > ``state.emotion_vector`` > neutral
+    default ``(valence=0, arousal=0.3)``. The DQN itself takes only the
+    melody, key, and emotion vector — lyrics never enter this path.
+    """
+    bind_request_context(
+        request,
+        session_id=str(payload.session_id),
+        pipeline_stage="harmony",
+    )
+    state = _get_session_or_404(str(payload.session_id))
+    if not state.melody_notes:
+        raise HTTPException(
+            status_code=422,
+            detail="Session has no melody_notes; upload a hum via /melody/from-hum first.",
+        )
+
+    emotion_vector = payload.emotion_vector or state.emotion_vector or EmotionVector(valence=0.0, arousal=0.3)
+    run_id = experiment_logger.start_run(
+        "chords_from_melody",
+        metadata={
+            "session_id": str(state.session_id),
+            "top_k": payload.top_k,
+            "emotion_vector": emotion_vector.model_dump(),
+            "key": state.detected_key,
+        },
+    )
+    try:
+        # Harmonize a beat-grid-snapped copy (chord model only); the stored
+        # melody stays unquantized. See ml/harmony/quantize.py.
+        chord_progressions = generate_dqn_chords(
+            notes_to_harmony_grid(state.melody_notes),
+            key=state.detected_key or "C major",
+            emotion_vector=emotion_vector,
+            top_k=payload.top_k,
+            tempo_bpm=state.detected_tempo or 120.0,
+        )
+        state.emotion_vector = emotion_vector
+        state.chord_progressions = chord_progressions
+        add_history(
+            state,
+            "chords_from_melody",
+            {
+                "top_k": payload.top_k,
+                "emotion_vector": emotion_vector.model_dump(),
+                "progression_count": len(chord_progressions),
+                "run_id": run_id,
+            },
+        )
+        _update_explanation_report(
+            state,
+            source_action="chords_from_melody",
+            summary="DQN harmonizer generated chord progressions from the session melody and emotion vector (no lyrics).",
+        )
+        experiment_logger.finish_run(run_id)
+        _save_session(state)
+        return ChordsFromMelodyResponse(
+            session_id=state.session_id,
+            chord_progressions=chord_progressions,
+            emotion_vector=emotion_vector,
+            run_id=run_id,
+        )
+    except HTTPException:
+        experiment_logger.finish_run(run_id)
+        raise
+    except Exception as exc:  # pragma: no cover - DQN/model failures
+        experiment_logger.finish_run(run_id, error=exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/moods")
+def list_moods() -> dict[str, list[str]]:
+    """Return the canonical mood-preset labels (the Song Brief vocabulary).
+
+    The UI fetches this to populate the Song Brief dropdown so the client and
+    backend never drift on the mood taxonomy.
+    """
+    return {"labels": list(EMOTION_PRESET_LABELS)}
+
+
+@app.post("/session/mood", response_model=SessionMoodResponse)
+def session_mood_endpoint(request: Request, payload: SessionMoodRequest) -> SessionMoodResponse:
+    """Persist an author-chosen Song Brief mood as the canonical session emotion.
+
+    Sets ``state.emotion_vector`` from the preset, marks it ``emotion_source =
+    "authored"``, and records the label. This is the single source of truth that
+    cascades into the DQN harmonizer, the continuation temperature, and the GPT
+    lyric prompt — all of which already read ``state.emotion_vector``.
+    """
+    bind_request_context(request, session_id=str(payload.session_id), pipeline_stage="session")
+    state = _get_session_or_404(str(payload.session_id))
+    vector = lookup_emotion_preset(payload.mood)
+    if vector is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown mood '{payload.mood}'; must be one of: {', '.join(EMOTION_PRESET_LABELS)}.",
+        )
+    state.emotion_vector = vector
+    state.mood_label = payload.mood
+    state.emotion_source = "authored"
+    # Mirror into user_params so the explanation report (reads user_params["mood"])
+    # and the version slider keep working.
+    state.user_params["mood"] = payload.mood
+    state.user_params["last_mood_label"] = payload.mood
+    state.user_params["last_mood_source"] = "authored"
+    add_history(
+        state,
+        "mood_set",
+        {
+            "mood_label": payload.mood,
+            "valence": vector.valence,
+            "arousal": vector.arousal,
+            "source": "authored",
+        },
+    )
+    _update_explanation_report(
+        state,
+        source_action="session_mood",
+        summary=(
+            f"Song Brief set mood '{payload.mood}' "
+            f"(v={vector.valence:+.2f}, a={vector.arousal:+.2f}); this drives DQN harmony "
+            "bias, melody-continuation temperature, and the GPT lyric emotion vector."
+        ),
+    )
+    _save_session(state)
+    return SessionMoodResponse(
+        session_id=state.session_id,
+        mood_label=payload.mood,
+        emotion_vector=vector,
+        emotion_source="authored",
     )
 
 
@@ -685,7 +981,12 @@ def session_chat(request: Request, session_id: str, payload: SessionChatRequest)
     bind_request_context(request, session_id=session_id, pipeline_stage="explanation", use_case="explain")
     state = _get_session_or_404(session_id)
     append_chat_message(state, "user", payload.message)
-    chat_reply = build_chat_reply(state, payload.message, pipeline=_get_gpt_pipeline())
+    chat_reply = build_chat_reply(
+        state,
+        payload.message,
+        pipeline=_get_gpt_pipeline(),
+        language=payload.language,
+    )
     reply = chat_reply.message
     state.chat_history.append(reply)
     state.user_params["last_chat_source"] = chat_reply.source
@@ -728,13 +1029,6 @@ def session_chat(request: Request, session_id: str, payload: SessionChatRequest)
         reply_limits=chat_reply.limits,
         reply_error=chat_reply.error,
     )
-
-
-@app.post("/writerblock/help", response_model=WriterBlockHelpResponse)
-def writerblock_endpoint(request: Request, payload: WriterBlockHelpRequest) -> WriterBlockHelpResponse:
-    bind_request_context(request, pipeline_stage="lyrics")
-    suggestions, explanation = generate_help(payload.text, payload.mood)
-    return WriterBlockHelpResponse(suggestions=suggestions, explanation=explanation)
 
 
 @app.get("/artifact/{artifact_id}", response_model=ArtifactListingResponse)

@@ -1,9 +1,8 @@
 -e ..
-basic-pitch==0.4.0
 librosa>=0.10,<1
 noisereduce>=3,<4
 numpy>=1.26,<3
-onnxruntime>=1.24,<2
+pesto-pitch>=2,<3
 pyloudnorm>=0.1,<1
 soundfile>=0.13,<1
 MIDIUtil>=1.2.1,<2

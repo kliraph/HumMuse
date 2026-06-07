@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from shared.schemas import (
     ArtifactRef,
     ChatMessage,
+    EmotionVector,
     ExplanationReport,
     ExplanationPart,
     LyricSuggestion,
@@ -33,7 +34,6 @@ class MelodyFromHumResponse(BaseModel):
     melody_profile: MelodyProfile | None = None
     detected_key: str | None = None
     detected_tempo: float | None = None
-    chord_progressions: list[Progression] = Field(default_factory=list)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     run_id: str | None = None
     explanation: list[ExplanationPart] = Field(default_factory=list)
@@ -49,6 +49,53 @@ class LyricsToChordsResponse(BaseModel):
     top_progressions: list[list[str]] = Field(..., min_length=3, max_length=3)
     chord_progressions: list[Progression] = Field(default_factory=list)
     explanation: list[ExplanationPart] = Field(default_factory=list)
+    # Mood provenance for the "suggest, don't override" flow. When the session
+    # already has an author-chosen Song Brief mood, the lyric-inferred mood is
+    # surfaced as a suggestion instead of overwriting the authored vector.
+    detected_mood: str | None = None
+    detected_emotion_vector: EmotionVector | None = None
+    mood_overridden: bool = False
+    mood_suggestion_pending: bool = False
+
+
+class ChordsFromMelodyRequest(BaseModel):
+    """Request body for melody-driven DQN chord generation.
+
+    No lyrics involved — the caller has already uploaded a melody to the
+    session and wants chords driven purely by the melody + an optional
+    emotion. When ``emotion_vector`` is omitted, the endpoint uses
+    ``state.emotion_vector`` if present, otherwise a neutral default
+    (valence=0, arousal=0.3).
+    """
+
+    session_id: UUID
+    emotion_vector: EmotionVector | None = None
+    top_k: int = Field(default=3, ge=1, le=5)
+
+
+class ChordsFromMelodyResponse(BaseModel):
+    session_id: UUID
+    chord_progressions: list[Progression] = Field(default_factory=list)
+    emotion_vector: EmotionVector
+    run_id: str | None = None
+
+
+class SessionMoodRequest(BaseModel):
+    """Persist an author-chosen Song Brief mood as the canonical session emotion.
+
+    ``mood`` must be one of the curated preset labels (EMOTION_PRESET_LABELS);
+    the endpoint rejects anything else with 422.
+    """
+
+    session_id: UUID
+    mood: str = Field(..., min_length=1)
+
+
+class SessionMoodResponse(BaseModel):
+    session_id: UUID
+    mood_label: str
+    emotion_vector: EmotionVector
+    emotion_source: str
 
 
 class ChordsManualRequest(BaseModel):
@@ -66,7 +113,6 @@ class ChordsManualRequest(BaseModel):
 class ChordsManualResponse(BaseModel):
     session_id: UUID
     chord_progression: Progression
-    session_id: UUID | None = None
 
 
 class MelodyContinueRequest(BaseModel):
@@ -114,16 +160,6 @@ class SuggestLyricsResponse(BaseModel):
     error: str | None = None
 
 
-class WriterBlockHelpRequest(BaseModel):
-    text: str = Field(..., min_length=1)
-    mood: str | None = None
-
-
-class WriterBlockHelpResponse(BaseModel):
-    suggestions: list[str] = Field(default_factory=list)
-    explanation: list[ExplanationPart] = Field(default_factory=list)
-
-
 class RefineSessionRequest(BaseModel):
     instruction: str = Field(..., min_length=1)
     target: str | None = None
@@ -131,6 +167,7 @@ class RefineSessionRequest(BaseModel):
 
 class SessionChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
+    language: str | None = None
 
 
 class SessionChatResponse(BaseModel):

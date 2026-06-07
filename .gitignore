@@ -211,3 +211,5 @@ storage/artifacts/
 storage/models/
 storage/*.db
 !storage/.gitkeep
+evaluation/
+project_hummuse_status.md

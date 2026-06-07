@@ -8,7 +8,6 @@ from typing import Any
 
 import soundfile as sf
 
-from ml.melody_sketchpad.chord_suggest import suggest_chords
 from ml.melody_sketchpad.key_detect import detect_key
 from ml.melody_sketchpad.midi_export import notes_to_midi
 from ml.melody_sketchpad.notes import melody_notes_to_events, note_events_to_melody_notes
@@ -21,7 +20,7 @@ from ml.melody_sketchpad.preprocess import (
 )
 from ml.melody_sketchpad.profile import build_melody_profile
 from ml.melody_sketchpad.smooth import smooth_notes
-from shared.schemas import ChordSuggestion, ExplanationPart, MelodyNote, MelodyProfile, NoteEvent
+from shared.schemas import ExplanationPart, MelodyNote, MelodyProfile, NoteEvent
 
 _ROUND_DIGITS = 3
 
@@ -32,7 +31,6 @@ class MelodyResult:
     note_events: list[NoteEvent]
     melody_profile: MelodyProfile
     detected_key: str | None
-    chords: list[ChordSuggestion]
     explanation: list[ExplanationPart]
     midi_bytes: bytes
     detected_tempo: float
@@ -71,6 +69,7 @@ def run_melody_pipeline(
     timings["preprocess_audio"] = _elapsed_ms(preprocess_started)
 
     tempo_started = time.perf_counter()
+    detection_succeeded = True
     if tempo_bpm is not None:
         # Manual override — caller knows the tempo (or wants to force it
         # for reproducibility in tests/golden runs). Skip detection.
@@ -92,16 +91,29 @@ def run_melody_pipeline(
     resolved_tempo_int = int(round(tempo))
 
     notes_started = time.perf_counter()
-    melody, extraction_meta = _extract_melody_notes(
+    # Only let the IOI estimator override when librosa's beat tracker fell back
+    # to its flat 100 BPM net; a user-provided or successfully-detected tempo
+    # always wins.
+    allow_ioi_fallback = (
+        tempo_bpm is None and not used_audio_fallback and not detection_succeeded
+    )
+    melody, extraction_meta, resolved_tempo = _extract_melody_notes(
         processed_audio,
         DEFAULT_SAMPLE_RATE,
         audio_bytes=audio_bytes,
         tempo_bpm=resolved_tempo_int,
         mood=mood,
         used_audio_fallback=used_audio_fallback,
+        allow_ioi_fallback=allow_ioi_fallback,
     )
     timings["generate_notes"] = _elapsed_ms(notes_started)
     metadata.update(extraction_meta)
+    # The IOI fallback may have corrected the tempo from the flat detection net;
+    # keep detected_tempo, metadata, and MIDI export aligned with the beats the
+    # notes were actually converted into.
+    tempo = float(resolved_tempo)
+    resolved_tempo_int = int(round(tempo))
+    metadata["tempo_bpm"] = round(tempo, 2)
 
     # Quantization is intentionally NOT applied here. PESTO produces 10 ms-
     # resolution onsets that respect the natural rubato of humming; snapping
@@ -128,7 +140,6 @@ def run_melody_pipeline(
     timings["export_midi"] = _elapsed_ms(midi_started)
 
     explain_started = time.perf_counter()
-    chords = suggest_chords()
     explanation = _build_explanation(
         used_audio_fallback=used_audio_fallback,
         processed_samples=int(processed_audio.shape[0]),
@@ -142,7 +153,6 @@ def run_melody_pipeline(
         note_events=note_events,
         melody_profile=profile,
         detected_key=detected_key,
-        chords=chords,
         explanation=explanation,
         midi_bytes=midi_bytes,
         detected_tempo=tempo,
@@ -188,6 +198,45 @@ def _detect_tempo(audio: Any, sample_rate: int) -> tuple[float, bool]:
     return tempo_value, True
 
 
+def estimate_tempo_from_onsets(
+    onsets_seconds: list[float],
+    *,
+    minimum_bpm: float = 60.0,
+    maximum_bpm: float = 160.0,
+) -> float | None:
+    """Median inter-onset-interval tempo estimate, octave-folded into range.
+
+    Used as a fallback when librosa beat tracking fails on short hums (it tends
+    to return the flat 100 BPM safety net, which misaligns the seconds->beats
+    conversion and the downstream harmony grid). Assumes the median gap between
+    consecutive onsets is roughly one beat, then doubles/halves the result until
+    it lands in ``[minimum_bpm, maximum_bpm)``.
+
+    Returns ``None`` when there are too few onsets to estimate, so callers can
+    keep their existing fallback value.
+    """
+    import numpy as np
+
+    onsets = sorted(float(value) for value in onsets_seconds)
+    if len(onsets) < 2:
+        return None
+    intervals = np.diff(onsets)
+    intervals = intervals[intervals > 1e-3]
+    if intervals.size == 0:
+        return None
+    beat_seconds = float(np.median(intervals))
+    if beat_seconds <= 0:
+        return None
+    bpm = 60.0 / beat_seconds
+    if not np.isfinite(bpm) or bpm <= 0:
+        return None
+    while bpm < minimum_bpm:
+        bpm *= 2.0
+    while bpm >= maximum_bpm:
+        bpm /= 2.0
+    return bpm
+
+
 class NoMelodyDetectedError(ValueError):
     """Raised when the extractor finds no melodic content in the audio."""
 
@@ -200,11 +249,22 @@ def _extract_melody_notes(
     tempo_bpm: int | None,
     mood: str | None,
     used_audio_fallback: bool,
-) -> tuple[list[MelodyNote], dict[str, Any]]:
+    allow_ioi_fallback: bool = False,
+) -> tuple[list[MelodyNote], dict[str, Any], float]:
+    """Extract beat-based melody notes, returning the tempo actually used.
+
+    When ``allow_ioi_fallback`` is set (librosa beat tracking failed and the
+    caller did not supply a tempo), the raw second-valued PESTO onsets feed
+    :func:`estimate_tempo_from_onsets`, and the resulting tempo replaces the
+    flat detection fallback for the seconds->beats conversion. The resolved
+    tempo is returned so the caller can keep ``detected_tempo`` and MIDI export
+    consistent with the beat positions.
+    """
     meta: dict[str, Any] = {}
+    resolved_tempo = float(tempo_bpm if tempo_bpm else 100)
     if used_audio_fallback:
         meta["melody_source"] = "mock_decode_fallback"
-        return _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood), meta
+        return _generate_mock_melody(audio_bytes, tempo_bpm=tempo_bpm, mood=mood), meta, resolved_tempo
 
     confidence_result = extract_melody_or_fallback(audio, sample_rate)
     meta["pitched_ratio"] = round(float(confidence_result.pitched_ratio), 4)
@@ -219,8 +279,20 @@ def _extract_melody_notes(
     meta["melody_source"] = (
         "pesto_rhythm_fallback" if confidence_result.used_fallback else "pesto"
     )
-    melody = note_events_to_melody_notes(confidence_result.notes, tempo_bpm=tempo_bpm)
-    return melody, meta
+
+    if allow_ioi_fallback:
+        ioi_tempo = estimate_tempo_from_onsets(
+            [float(note.onset) for note in confidence_result.notes]
+        )
+        if ioi_tempo is not None:
+            resolved_tempo = ioi_tempo
+            meta["tempo_source"] = "ioi_fallback"
+            meta["tempo_bpm"] = round(ioi_tempo, 2)
+
+    melody = note_events_to_melody_notes(
+        confidence_result.notes, tempo_bpm=int(round(resolved_tempo))
+    )
+    return melody, meta, resolved_tempo
 
 
 def _generate_mock_melody(

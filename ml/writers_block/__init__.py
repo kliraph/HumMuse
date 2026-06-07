@@ -1,2 +1,0 @@
-"""Writers block helper module."""
-

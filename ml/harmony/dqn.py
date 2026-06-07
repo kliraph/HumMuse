@@ -12,6 +12,13 @@ from ml.harmony.annotation import annotate_chord_positions
 from ml.harmony.chord_symbols import QUALITY_TEMPLATES, derive_chord_symbol
 from ml.harmony.emotion_modulation import emotion_bias_rationale, emotion_bias_vector, emotion_values
 from ml.harmony.explain import build_explanation
+from ml.harmony.key_constraint import (
+    DEFAULT_LAMBDA_KEY,
+    key_filter_bias,
+    key_filter_rationale,
+    key_scale_pcs,
+    out_of_scale_pcs,
+)
 from ml.harmony.reward_attribution import compute_attribution
 from shared.schemas import ChordDistribution, ChordProgression, EmotionVector
 
@@ -49,7 +56,7 @@ BAR_TICKS_4_4 = 96
 CONDITION_WINDOW = 8
 INPUT_SIZE = 64
 HIDDEN_SIZE = 512
-CHECKPOINT_FILENAME = "epoch14_reward4.298_mle_loss262.858_beta0.700.pth"
+CHECKPOINT_FILENAME = "epoch24_reward4.342_mle_loss260.997_beta0.700.pth"
 if load_dotenv is not None:
     load_dotenv()
 _PACKAGED_CHECKPOINT = (
@@ -67,6 +74,15 @@ DEFAULT_CHECKPOINT = Path(
 )
 
 _MODEL_CACHE: "_CachedModel | None" = None
+
+
+class CheckpointArchitectureError(RuntimeError):
+    """Raised when a checkpoint's tensor shapes don't match the vendored model.
+
+    Distinct from FileNotFoundError (missing file) — this means the file exists
+    but was trained with a different architecture, so the fix is to point at a
+    matching checkpoint rather than to supply one.
+    """
 
 
 @dataclass(frozen=True)
@@ -331,7 +347,20 @@ def load_model(checkpoint_path: str | Path | None = None) -> _CachedModel:
 
     model = _DQNChord(condition_window=CONDITION_WINDOW, input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE)
     checkpoint = _torch_load(resolved_path)
-    model.load_state_dict(checkpoint["model"])
+    try:
+        model.load_state_dict(checkpoint["model"])
+    except RuntimeError as exc:
+        # A size/shape mismatch means the checkpoint was trained with a
+        # different architecture than this vendored _DQNChord (e.g. a different
+        # condition window or feature layout). torch's raw message is opaque and
+        # surfaces as an unexplained 500 — raise an actionable error instead.
+        raise CheckpointArchitectureError(
+            f"DQN checkpoint at {resolved_path} is incompatible with the vendored "
+            f"model architecture (condition_window={CONDITION_WINDOW}, "
+            f"input_size={INPUT_SIZE}, hidden_size={HIDDEN_SIZE}). Point "
+            f"HUMMUSE_DQN_CHECKPOINT at a matching checkpoint, or update _DQNChord "
+            f"to match this one. Underlying error: {exc}"
+        ) from exc
     model.eval()
 
     metadata = {
@@ -469,25 +498,28 @@ def _rollout(
     distributions: list[ChordDistribution] = []
     derivations = []
 
+    lambda_key = _key_filter_lambda()
     with torch.no_grad():
         for position, event in enumerate(events):
             state = build_dqn_state(events, prev_one_hot, position=position)
             q1, q2, q4, q13, hidden, dueling = model.forward_with_dueling(state, hidden)
             q13_biased, emotion_bias = _apply_emotion_q_bias(q13, emotion_vector, key=key)
-            policy = act_outputs(q1, q2, q4, q13_biased)
-            selected = decode(policy, q1, q2, q4, q13_biased, candidate_rank=candidate_rank)
+            q13_filtered, key_constraint = _apply_key_filter(q13_biased, key=key, lambda_key=lambda_key)
+            policy = act_outputs(q1, q2, q4, q13_filtered)
+            selected = decode(policy, q1, q2, q4, q13_filtered, candidate_rank=candidate_rank)
             reward_attribution = compute_attribution(selected, event, prev_selected, key)
             distribution = build_chord_distribution(
                 position,
                 q1,
                 q2,
                 q4,
-                q13_biased,
+                q13_filtered,
                 policy,
                 selected,
                 dueling,
                 event,
                 emotion_bias=emotion_bias,
+                key_constraint=key_constraint,
                 reward_attribution=reward_attribution,
                 prev_chord_pcs=prev_chord_pcs,
                 prev_chord_symbol=prev_chord_symbol,
@@ -609,6 +641,7 @@ def build_chord_distribution(
     event: tuple[int, int, int],
     *,
     emotion_bias: dict[str, Any] | None,
+    key_constraint: dict[str, Any] | None = None,
     reward_attribution: dict[str, float] | None,
     prev_chord_pcs: list[int],
     prev_chord_symbol: str | None,
@@ -654,11 +687,50 @@ def build_chord_distribution(
         },
         reward_attribution=reward_attribution,
         emotion_bias=emotion_bias,
+        key_constraint=key_constraint,
         selected=selected,
         model_kind="dqn",
         noise_state="disabled",
         noise_samples=None,
     )
+
+
+def _apply_key_filter(
+    q13: Any,
+    *,
+    key: str | None,
+    lambda_key: float,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Apply the soft key filter and emit the recorded ChordKeyConstraint payload."""
+
+    if not key or lambda_key == 0.0:
+        return q13, None
+    bias = key_filter_bias(q13, key=key, lambda_key=lambda_key)
+    flat = _flat(bias)
+    out_pcs = out_of_scale_pcs(key)
+    scale = sorted(key_scale_pcs(key) or set())
+    applied = any(abs(value) > 1e-12 for value in flat) and bool(out_pcs)
+    return q13 + bias, {
+        "applied": applied,
+        "declared_key": key,
+        "scale_pcs": scale,
+        "out_of_scale_pcs": out_pcs,
+        "lambda_key": float(lambda_key),
+        "q_delta_per_pc": flat,
+        "rationale": key_filter_rationale(key, lambda_key),
+    }
+
+
+def _key_filter_lambda() -> float:
+    if load_dotenv is not None:
+        load_dotenv()
+    raw = os.getenv("HUMMUSE_KEY_FILTER_LAMBDA")
+    if raw is None:
+        return DEFAULT_LAMBDA_KEY
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_LAMBDA_KEY
 
 
 def _apply_emotion_q_bias(
@@ -735,6 +807,15 @@ def _progression_model_confidence(distributions: list[ChordDistribution]) -> flo
 
 
 def _progression_mood_alignment(distributions: list[ChordDistribution]) -> float | None:
+    """Mean agreement (0..1) between the selected chords and the applied emotion bias.
+
+    "Mood" is the whole emotion vector — valence *and* arousal. Any applied bias
+    counts, so a pure-arousal request (``valence=0, arousal>0``) still yields a
+    score: high arousal at neutral valence is a real mood (tense/alert), not a
+    "no mood" case, and its Lerdahl tension bias has concrete pitch-class
+    targets to align against. Returns ``None`` only when no distribution had an
+    emotion bias applied at all.
+    """
     alignments = []
     for distribution in distributions:
         bias = distribution.emotion_bias
@@ -761,11 +842,24 @@ def _progression_mood_alignment(distributions: list[ChordDistribution]) -> float
 
 
 def _model_pitch_class_probs(distribution: ChordDistribution) -> list[float]:
+    """Softmax of the *raw* model pitch-class Q values.
+
+    ``q_values.pitch_class`` stores the fully-biased tensor that drove decoding
+    (raw model Q + emotion bias + soft key filter). Model confidence must
+    reflect the un-biased model, so we strip *both* additive biases back out —
+    not just the emotion bias. Each ``q_delta_per_pc`` was added to the raw Q
+    (``q_filtered = q_raw + emotion_delta + key_delta``), so subtracting them
+    recovers ``q_raw``.
+    """
     q_values = list(distribution.q_values.pitch_class)
-    bias = distribution.emotion_bias
-    if bias is not None and bias.q_delta_per_pc:
+    for adjustment in (distribution.emotion_bias, distribution.key_constraint):
+        if adjustment is None:
+            continue
+        deltas = adjustment.q_delta_per_pc
+        if not deltas:
+            continue
         q_values = [
-            value - bias.q_delta_per_pc[index] if index < len(bias.q_delta_per_pc) else value
+            value - deltas[index] if index < len(deltas) else value
             for index, value in enumerate(q_values)
         ]
     return _softmax_values(q_values)

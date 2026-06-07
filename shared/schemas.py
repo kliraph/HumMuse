@@ -17,7 +17,16 @@ Section = Literal["verse", "pre_chorus", "chorus", "bridge"]
 
 
 class SchemaModel(BaseModel):
-    model_config = ConfigDict(ser_json_bytes="base64", val_json_bytes="base64")
+    # extra="forbid": unknown fields are a validation error, not silently
+    # dropped. These models are the shared producer/consumer contract across
+    # backend/ml/ui; rejecting stray keys surfaces drift (a renamed/removed
+    # field, a typo'd key) at the boundary instead of letting data vanish on a
+    # model_dump → model_validate round-trip.
+    model_config = ConfigDict(
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
+        extra="forbid",
+    )
 
 
 class MelodyNote(SchemaModel):
@@ -47,6 +56,88 @@ class EmotionVector(SchemaModel):
     arousal: float = Field(..., ge=-1, le=1)
 
 
+# --- Canonical mood/emotion taxonomy ---------------------------------------
+#
+# The single source of truth for the system's mood vocabulary. Every consumer
+# — the UI Song Brief dropdown (via GET /moods), the backend refinement ops,
+# the GPT-down keyword fallback, and the /session/mood endpoint — uses these
+# 12 presets. Each maps to a curated point on the valence/arousal circumplex.
+#
+# Layout on the valence/arousal plane:
+#     joyful       v=+0.8 a=+0.7   bright, energetic
+#     triumphant   v=+0.9 a=+0.8   intense joy (joyful peak)
+#     uplift       v=+0.6 a=+0.5   hopeful, rising
+#     hopeful      v=+0.4 a=+0.3   gentle optimism
+#     romantic     v=+0.5 a=+0.2   warm, intimate
+#     calm         v=+0.3 a=-0.4   peaceful, low energy
+#     neutral      v=+0.0 a=+0.0   no signal
+#     reflective   v=-0.1 a=-0.3   contemplative, still
+#     melancholic  v=-0.6 a=-0.2   sad, low energy
+#     dark         v=-0.7 a=+0.1   heavy, slow burn
+#     anxious      v=-0.4 a=+0.7   uneasy, high energy
+#     tense        v=-0.3 a=+0.6   tight, charged
+_EMOTION_PRESETS: dict[str, EmotionVector] = {
+    "joyful":      EmotionVector(valence=0.8,  arousal=0.7),
+    "triumphant":  EmotionVector(valence=0.9,  arousal=0.8),
+    "uplift":      EmotionVector(valence=0.6,  arousal=0.5),
+    "hopeful":     EmotionVector(valence=0.4,  arousal=0.3),
+    "romantic":    EmotionVector(valence=0.5,  arousal=0.2),
+    "calm":        EmotionVector(valence=0.3,  arousal=-0.4),
+    "neutral":     EmotionVector(valence=0.0,  arousal=0.0),
+    "reflective":  EmotionVector(valence=-0.1, arousal=-0.3),
+    "melancholic": EmotionVector(valence=-0.6, arousal=-0.2),
+    "dark":        EmotionVector(valence=-0.7, arousal=0.1),
+    "anxious":     EmotionVector(valence=-0.4, arousal=0.7),
+    "tense":       EmotionVector(valence=-0.3, arousal=0.6),
+}
+
+# Canonical display order for the UI dropdown (positive→neutral→negative).
+EMOTION_PRESET_LABELS: tuple[str, ...] = tuple(_EMOTION_PRESETS)
+
+_DEFAULT_EMOTION_VECTOR = EmotionVector(valence=0.1, arousal=0.4)
+
+# Legacy/aliased labels that older UI builds or persisted sessions may carry,
+# mapped onto a canonical preset key.
+_MOOD_LABEL_ALIASES: dict[str, str] = {
+    "melancholy": "melancholic",
+}
+
+
+def lookup_emotion_preset(mood: str) -> EmotionVector | None:
+    """Return the curated ``EmotionVector`` for a preset key, or ``None``.
+
+    Unlike :func:`build_emotion_vector`, this does **not** substitute a default
+    for unknown labels — it returns ``None`` so callers can distinguish "this
+    was a recognised mood preset" from "no match" (e.g. the refinement
+    executor's free-form ``emotion`` setter, which must leave the existing
+    vector untouched on a miss rather than clobber it with the default).
+    """
+    return _EMOTION_PRESETS.get(mood)
+
+
+def build_emotion_vector(mood: str) -> EmotionVector:
+    """Map a coarse mood-preset key to a curated ``EmotionVector``.
+
+    Used by the mood-responder fallback (when GPT is down). Unknown keys fall
+    back to a mildly-positive default — callers that need to treat an unknown
+    key as "no signal" should use :func:`lookup_emotion_preset` instead.
+    """
+    return _EMOTION_PRESETS.get(mood, _DEFAULT_EMOTION_VECTOR)
+
+
+def normalize_mood_label(label: str | None) -> str | None:
+    """Normalise a mood label to a canonical preset key, or ``None``.
+
+    Applies known aliases (e.g. ``melancholy`` -> ``melancholic``); returns the
+    label unchanged if it is already a canonical preset; otherwise ``None`` so
+    callers can fall back (e.g. to ``neutral`` in the UI dropdown).
+    """
+    if not label:
+        return None
+    canonical = _MOOD_LABEL_ALIASES.get(label, label)
+    return canonical if canonical in _EMOTION_PRESETS else None
+
+
 class MelodySuggestion(SchemaModel):
     midi_bytes: bytes = Field(...)
     notes: list[NoteEvent] = Field(default_factory=list)
@@ -63,106 +154,6 @@ class LyricSuggestion(SchemaModel):
     text: str = Field(..., min_length=1)
     mode: str = Field(..., min_length=1)
     syllable_count: int = Field(..., ge=0)
-
-
-_PITCH_CLASS_LABELS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-_PITCH_CLASS_MEMBERSHIP_LABELS = [*_PITCH_CLASS_LABELS, "triad_sentinel"]
-
-
-def _top_margin(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    ranked = sorted((float(value) for value in values), reverse=True)
-    if len(ranked) == 1:
-        return ranked[0]
-    return ranked[0] - ranked[1]
-
-
-def _mean(values: list[float]) -> float:
-    return sum(values) / len(values) if values else 0.0
-
-
-def _advantages(values: list[float]) -> tuple[float, list[float]]:
-    value = _mean(values)
-    return value, [float(item) - value for item in values]
-
-
-def _distribution_defaults(data: dict[str, Any]) -> dict[str, Any]:
-    if "policy" not in data:
-        rest = dict(data.get("rest", {}))
-        octave = dict(data.get("octave", {}))
-        inversion = dict(data.get("inversion", {}))
-        pitch_class = dict(data.get("pitch_class", {}))
-        membership = list(data.get("pitch_class_membership", []))
-        labels = list(data.get("pitch_class_labels", _PITCH_CLASS_MEMBERSHIP_LABELS))
-        data["policy"] = {
-            "rest": rest,
-            "octave": octave,
-            "inversion": inversion,
-            "pitch_class": pitch_class,
-            "pitch_class_membership": membership,
-            "pitch_class_labels": labels,
-        }
-
-    policy = dict(data.get("policy", {}))
-    position = int(data.get("position", 0))
-    rest = dict(policy.get("rest", {}))
-    octave = dict(policy.get("octave", {}))
-    inversion = dict(policy.get("inversion", {}))
-    membership = list(policy.get("pitch_class_membership", []))
-
-    if "q_values" not in data:
-        data["q_values"] = {
-            "rest": float(rest.get("rest", 0.0)),
-            "octave": [float(octave.get(label, 0.0)) for label in ("2", "3")],
-            "inversion": [float(inversion.get(str(index), 0.0)) for index in range(4)],
-            "pitch_class": [float(value) for value in membership],
-        }
-
-    q_values = dict(data.get("q_values", {}))
-    octave_values = [float(value) for value in q_values.get("octave", [])]
-    inversion_values = [float(value) for value in q_values.get("inversion", [])]
-    pitch_class_values = [float(value) for value in q_values.get("pitch_class", [])]
-    rest_q = float(q_values.get("rest", 0.0))
-
-    if "q_margin" not in data:
-        data["q_margin"] = {
-            "rest": _top_margin([rest_q, 1.0 - rest_q]),
-            "octave": _top_margin(octave_values),
-            "inversion": _top_margin(inversion_values),
-            "pitch_class": _top_margin(pitch_class_values),
-        }
-
-    if "dueling" not in data:
-        value_rest, advantage_rest = _advantages([rest_q, 1.0 - rest_q])
-        value_octave, advantage_octave = _advantages(octave_values)
-        value_inversion, advantage_inversion = _advantages(inversion_values)
-        value_pc, advantage_pc = _advantages(pitch_class_values)
-        data["dueling"] = {
-            "value_rest": value_rest,
-            "value_octave": value_octave,
-            "value_inversion": value_inversion,
-            "value_pc": value_pc,
-            "advantage_rest": advantage_rest,
-            "advantage_octave": advantage_octave,
-            "advantage_inversion": advantage_inversion,
-            "advantage_pc": advantage_pc,
-        }
-
-    data.setdefault(
-        "context",
-        {
-            "prev_chord_pcs": [],
-            "prev_chord_symbol": None,
-            "current_note": {"pitch": 0, "duration": 0, "position": position},
-        },
-    )
-    data.setdefault("reward_attribution", None)
-    data.setdefault("emotion_bias", None)
-    data.setdefault("model_kind", "dqn")
-    data.setdefault("noise_state", "disabled")
-    data.setdefault("noise_samples", None)
-    return data
 
 
 class ChordPolicy(SchemaModel):
@@ -225,6 +216,22 @@ class ChordEmotionBias(SchemaModel):
     rationale: str
 
 
+class ChordKeyConstraint(SchemaModel):
+    """Inference-time soft key filter applied to the pitch-class Q head.
+
+    Records which PCs were demoted (out-of-scale relative to the declared key)
+    and the per-PC Q delta so explanations can reconstruct the filter's effect.
+    """
+
+    applied: bool
+    declared_key: str | None = None
+    scale_pcs: list[int] = Field(default_factory=list)
+    out_of_scale_pcs: list[int] = Field(default_factory=list)
+    lambda_key: float = 0.0
+    q_delta_per_pc: list[float] = Field(default_factory=list)
+    rationale: str = ""
+
+
 class SelectedChord(SchemaModel):
     is_rest: bool
     octave: int | None = None
@@ -250,17 +257,11 @@ class ChordDistribution(SchemaModel):
     context: ChordContext
     reward_attribution: ChordRewardAttribution | None = None
     emotion_bias: ChordEmotionBias | None = None
+    key_constraint: ChordKeyConstraint | None = None
     selected: SelectedChord
     model_kind: Literal["dqn"] = "dqn"
     noise_state: Literal["disabled", "enabled"] = "disabled"
     noise_samples: int | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _accept_legacy_flat_distribution(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            return _distribution_defaults(dict(data))
-        return data
 
     @property
     def rest(self) -> dict[str, Probability]:
@@ -412,8 +413,9 @@ _REFINEMENT_PARAM_RULES: dict[str, dict[str, Any]] = {
         "requested_target": "str",
         "preserve": "list[str]",
         "emotion": "str",
+        "emotion_valence": (-1.0, 1.0),
+        "emotion_arousal": (-1.0, 1.0),
         "genre": "str",
-        "mood": "str",
     },
 }
 
@@ -521,6 +523,12 @@ class SessionState(SchemaModel):
     chord_progressions: list[ChordProgression] = Field(default_factory=list)
     lyrics_text: str | None = None
     emotion_vector: EmotionVector | None = None
+    # The human-readable mood label behind ``emotion_vector`` and its
+    # provenance. ``emotion_source`` lets generation decide whether to respect
+    # an author's Song Brief choice ("authored") or treat the current vector as
+    # an auto-inferred guess that may be re-suggested ("detected").
+    mood_label: str | None = None
+    emotion_source: Literal["authored", "detected"] | None = None
     melody_suggestions: list[MelodySuggestion] = Field(default_factory=list)
     lyric_suggestions: list[LyricSuggestion] = Field(default_factory=list)
     explanation_report: ExplanationReport | None = None
