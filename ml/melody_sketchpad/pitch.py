@@ -42,6 +42,15 @@ DEFAULT_ONSET_HOP_SAMPLES_AT_16K = 160  # 10 ms at 16 kHz
 DEFAULT_ONSET_FILTER_MAX_PITCH_STDDEV_SEMITONES = 0.5
 DEFAULT_ONSET_FILTER_AMPLITUDE_VALLEY_RATIO = 0.85
 DEFAULT_RMS_FRAME_SAMPLES = 400  # 25 ms at 16 kHz
+# Frame-level f0 smoothing + tuning correction (applied before segmentation).
+DEFAULT_PITCH_MEDIAN_FILTER_FRAMES = 5  # 50 ms at the 10 ms PESTO hop
+DEFAULT_TUNING_BIAS_MAX_SEMITONES = 0.5  # clamp on the global cents correction
+_TUNING_BIAS_MIN_VOICED_FRAMES = 8  # need a little evidence before correcting
+# Voicing hysteresis: bridge an unvoiced gap of at most this many frames when
+# pitch resumes at the same value and no onset fell in the gap. Rejoins a held
+# note briefly broken by a breath/glottal dropout, while a gap with an onset
+# (a real re-articulation) or a longer gap still ends the note.
+DEFAULT_MAX_UNVOICED_BRIDGE_FRAMES = 3  # 30 ms at the 10 ms PESTO hop
 
 _pesto_predict = None
 
@@ -317,6 +326,52 @@ def _compute_onset_frames(
     return np.asarray(onsets, dtype=int)
 
 
+def _median_filter_nan(values: np.ndarray, window: int) -> np.ndarray:
+    """NaN-aware centred median filter.
+
+    Smooths single/transient-frame flicker in the f0 contour (e.g. a brief
+    pitch scoop at a note transition) while preserving unvoiced (NaN) frames
+    and never bridging across them: if the centre frame is NaN it stays NaN.
+    """
+    n = len(values)
+    if window <= 1 or n == 0:
+        return values
+    half = window // 2
+    out = np.full(n, np.nan, dtype=np.float64)
+    for i in range(n):
+        if not np.isfinite(values[i]):
+            continue
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        win = values[lo:hi]
+        finite = win[np.isfinite(win)]
+        if finite.size:
+            out[i] = float(np.median(finite))
+    return out
+
+
+def _estimate_tuning_bias(
+    midi: np.ndarray,
+    *,
+    max_bias: float = DEFAULT_TUNING_BIAS_MAX_SEMITONES,
+    min_voiced: int = _TUNING_BIAS_MIN_VOICED_FRAMES,
+) -> float:
+    """Estimate a global tuning offset (in semitones) from the f0 contour.
+
+    A singer who is consistently ~40 cents flat puts every intended note a
+    little below its nearest semitone. The median deviation-from-nearest-
+    semitone recovers that bias robustly (boundary-crossing outliers don't
+    move the median). Subtracting it before rounding pulls flat/sharp notes
+    back to the pitch they were aiming for.
+    """
+    finite = midi[np.isfinite(midi)]
+    if finite.size < min_voiced:
+        return 0.0
+    deviation = finite - np.round(finite)  # in [-0.5, 0.5]
+    bias = float(np.median(deviation))
+    return float(np.clip(bias, -max_bias, max_bias))
+
+
 def _segment_pitch_frames(
     pitch_hz: np.ndarray,
     confidence: np.ndarray,
@@ -330,6 +385,9 @@ def _segment_pitch_frames(
     onset_frames: np.ndarray | None = None,
     rms_frames: np.ndarray | None = None,
     onset_filter_enabled: bool = True,
+    pitch_median_filter_frames: int = DEFAULT_PITCH_MEDIAN_FILTER_FRAMES,
+    tuning_correction_enabled: bool = True,
+    max_unvoiced_bridge_frames: int = DEFAULT_MAX_UNVOICED_BRIDGE_FRAMES,
 ) -> list[NoteEvent]:
     """Collapse frame-wise (Hz, confidence) into note events.
 
@@ -357,6 +415,15 @@ def _segment_pitch_frames(
     )
     midi = np.full(pitch_hz.shape, np.nan, dtype=np.float64)
     midi[voiced] = 69.0 + 12.0 * np.log2(pitch_hz[voiced] / 440.0)
+
+    # Smooth transient flicker, then remove the singer's global tuning bias so
+    # the per-note median rounds to the pitch that was actually aimed for.
+    if pitch_median_filter_frames and pitch_median_filter_frames > 1:
+        midi = _median_filter_nan(midi, pitch_median_filter_frames)
+    if tuning_correction_enabled:
+        bias = _estimate_tuning_bias(midi)
+        if bias != 0.0:
+            midi = midi - bias  # NaN - x stays NaN, so unvoiced frames are preserved
 
     min_frames = max(1, int(np.ceil((float(minimum_note_length_ms) / 1000.0) / hop_s)))
     onset_set: set[int] = (
@@ -388,18 +455,66 @@ def _segment_pitch_frames(
             )
         )
 
+    pending_gap = 0  # consecutive unvoiced frames since the last voiced frame
+    gap_start: int | None = None  # index of the first frame in the current gap
+
+    def _onset_in(lo: int, hi: int) -> bool:
+        return any(lo <= o <= hi for o in onset_set)
+
     for i, m in enumerate(midi):
         if not np.isfinite(m):
-            flush(i)
-            cur_midi = []
-            cur_conf = []
-            cur_start = None
+            if cur_start is not None:
+                # Only bridge gaps inside an *established* note (>= min_frames).
+                # A nascent sub-minimum fragment (e.g. a pitch scoop into the
+                # first note) is dropped at the gap, never stitched into a note.
+                if len(cur_midi) < min_frames:
+                    flush(i)
+                    cur_midi = []
+                    cur_conf = []
+                    cur_start = None
+                    pending_gap = 0
+                    gap_start = None
+                    continue
+                if pending_gap == 0:
+                    gap_start = i
+                pending_gap += 1
+                # Gap too long to bridge -> end the note at the gap's start so
+                # the trailing silence is not folded into its duration.
+                if pending_gap > max_unvoiced_bridge_frames:
+                    flush(gap_start)
+                    cur_midi = []
+                    cur_conf = []
+                    cur_start = None
+                    pending_gap = 0
+                    gap_start = None
             continue
+
         if cur_start is None:
             cur_start = i
             cur_midi = [float(m)]
             cur_conf = [float(confidence[i])]
+            pending_gap = 0
+            gap_start = None
             continue
+
+        # Resuming after a short unvoiced gap: bridge only if the note continues
+        # at the same pitch and no onset marked a re-articulation inside the gap.
+        if pending_gap > 0:
+            same_pitch = abs(m - float(np.median(cur_midi))) <= max_jump_semitones
+            if same_pitch and not _onset_in(gap_start, i):
+                cur_midi.append(float(m))
+                cur_conf.append(float(confidence[i]))
+                pending_gap = 0
+                gap_start = None
+                continue
+            flush(gap_start)
+            cur_start = i
+            cur_midi = [float(m)]
+            cur_conf = [float(confidence[i])]
+            pending_gap = 0
+            gap_start = None
+            continue
+
         # Force a split at strong amplitude/spectral onsets (recovers repeated
         # pitches in legato runs that the pitch-jump rule alone can't see).
         # The optional filter rejects release transients / passing tones /
@@ -416,7 +531,9 @@ def _segment_pitch_frames(
         else:
             cur_midi.append(float(m))
             cur_conf.append(float(confidence[i]))
-    flush(len(midi))
+
+    # End of stream: don't fold a trailing unvoiced gap into the final note.
+    flush(gap_start if pending_gap > 0 and gap_start is not None else len(midi))
 
     return events
 

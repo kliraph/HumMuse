@@ -1291,7 +1291,10 @@ def render_melody_continuation_section(state: dict[str, Any]) -> None:
                 if suggestion.get("notes"):
                     try:
                         st.audio(
-                            synthesize_wave_from_notes(suggestion["notes"]),
+                            synthesize_wave_from_notes(
+                                suggestion["notes"],
+                                bpm=float(state.get("detected_tempo") or 100.0),
+                            ),
                             format="audio/wav",
                         )
                     except Exception:

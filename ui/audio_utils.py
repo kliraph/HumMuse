@@ -229,18 +229,31 @@ def synthesize_wave_from_notes(
     notes: list[dict[str, Any]],
     *,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
+    bpm: float | None = None,
 ) -> bytes:
+    """Synthesize a sine-wave preview from note events.
+
+    ``onset``/``duration`` are interpreted as **seconds** when ``bpm`` is None,
+    or as **beats** (converted via the given tempo) when ``bpm`` is provided.
+    The pipeline's ``NoteEvent``s are in beats (see ml.melody_sketchpad), so
+    melody and continuation previews must pass ``bpm``; the chord-progression
+    helper builds seconds directly and omits it.
+    """
     if not notes:
         raise ValueError("Cannot synthesize audio without note events")
 
-    total_duration = max(float(note["onset"]) + float(note["duration"]) for note in notes) + 0.25
+    time_scale = (60.0 / max(1.0, float(bpm))) if bpm else 1.0
+
+    total_duration = (
+        max(float(note["onset"]) + float(note["duration"]) for note in notes) * time_scale + 0.25
+    )
     total_samples = max(1, int(total_duration * sample_rate))
     pcm = np.zeros(total_samples, dtype=np.float64)
 
     for note in notes:
         pitch = int(note["pitch"])
-        onset = float(note["onset"])
-        duration = float(note["duration"])
+        onset = float(note["onset"]) * time_scale
+        duration = float(note["duration"]) * time_scale
         velocity = int(note.get("velocity", 96))
         amplitude = min(1.0, max(0.1, velocity / 127.0)) * 0.25
         start = max(0, int(onset * sample_rate))
@@ -289,7 +302,8 @@ def render_audio_from_session(
                 return wav_path.read_bytes(), "midi2audio"
 
     if notes:
-        return synthesize_wave_from_notes(notes), "note_synth"
+        bpm = float(state.get("detected_tempo") or 100.0)
+        return synthesize_wave_from_notes(notes, bpm=bpm), "note_synth"
 
     if midi_bytes:
         raise RuntimeError(
